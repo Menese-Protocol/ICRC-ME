@@ -1,0 +1,5 @@
+.mops/
+.dfx/
+node_modules/
+token.wasm.gz
+token.did

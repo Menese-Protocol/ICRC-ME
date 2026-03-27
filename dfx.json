@@ -1,0 +1,10 @@
+{
+  "canisters": {
+    "token_a": { "type": "motoko", "main": "src/ledger/IndexedLedger.mo", "packtool": "mops sources" },
+    "token_b": { "type": "motoko", "main": "src/ledger/IndexedLedger.mo", "packtool": "mops sources" },
+    "clmm_pool": { "type": "motoko", "main": "src/CLMMPool.mo", "packtool": "mops sources" },
+    "rust_icrc": { "type": "custom", "wasm": "token.wasm.gz", "candid": "token.did", "build": "" }
+  },
+  "defaults": { "build": { "packtool": "mops sources" } },
+  "version": 1
+}

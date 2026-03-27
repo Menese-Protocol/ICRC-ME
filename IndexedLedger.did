@@ -1,0 +1,225 @@
+type Value = 
+ variant {
+   Array: vec Value;
+   Blob: blob;
+   Int: int;
+   Map: vec record {
+              text;
+              Value;
+            };
+   Nat: nat;
+   Text: text;
+ };
+type TransferFromError = 
+ variant {
+   BadBurn: record {min_burn_amount: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientAllowance: record {allowance: nat;};
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type TransferFromArgs = 
+ record {
+   amount: nat;
+   created_at_time: opt nat64;
+   fee: opt nat;
+   from: Account;
+   memo: opt blob;
+   spender_subaccount: opt blob;
+   to: Account;
+ };
+type TransferError = 
+ variant {
+   BadBurn: record {min_burn_amount: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type TransferArgs = 
+ record {
+   amount: nat;
+   created_at_time: opt nat64;
+   fee: opt nat;
+   from_subaccount: opt blob;
+   memo: opt blob;
+   to: Account;
+ };
+type Transaction = 
+ record {
+   amount: nat;
+   fee: opt nat;
+   from: opt Account;
+   index: nat;
+   kind: text;
+   memo: opt blob;
+   spender: opt Account;
+   timestamp: nat64;
+   to: opt Account;
+ };
+type InitArgs = 
+ record {
+   decimals: nat8;
+   fee: nat;
+   initial_balances: vec record {
+                           Account;
+                           nat;
+                         };
+   max_memo_length: opt nat;
+   max_supply: opt nat;
+   minting_account: Account;
+   name: text;
+   symbol: text;
+ };
+type IndexedLedger = 
+ service {
+   get_account_transactions: (args: GetAccountTransactionsArgs) ->
+    (GetAccountTransactionsResult) query;
+   icrc1_balance_of: (account: Account) -> (nat) query;
+   icrc1_decimals: () -> (nat8) query;
+   icrc1_fee: () -> (nat) query;
+   icrc1_metadata: () -> (vec record {
+                                text;
+                                Value;
+                              }) query;
+   icrc1_minting_account: () -> (opt Account) query;
+   icrc1_name: () -> (text) query;
+   icrc1_supported_standards: () ->
+    (vec record {
+           name: text;
+           url: text;
+         }) query;
+   icrc1_symbol: () -> (text) query;
+   icrc1_total_supply: () -> (nat) query;
+   icrc1_transfer: (transferArgs: TransferArgs) ->
+    (variant {
+       Err: TransferError;
+       Ok: nat;
+     });
+   icrc2_allowance: (allowanceArgs: AllowanceArgs) -> (Allowance) query;
+   icrc2_approve: (approveArgs: ApproveArgs) ->
+    (variant {
+       Err: ApproveError;
+       Ok: nat;
+     });
+   icrc2_transfer_from: (tfArgs: TransferFromArgs) ->
+    (variant {
+       Err: TransferFromError;
+       Ok: nat;
+     });
+   icrc3_get_blocks: (args: vec GetBlocksArgs) ->
+    (record {
+       blocks: vec Block;
+       log_length: nat;
+     }) query;
+   /// Get the certified tip of the block chain.
+   /// Returns the IC subnet BLS certificate + CBOR-encoded hash tree.
+   /// Clients verify: cert → certified_data == hash(tree) → tree witnesses last_block_hash.
+   icrc3_get_tip_certificate: () ->
+    (opt record {
+           certificate: blob;
+           hash_tree: blob;
+         }) query;
+   /// ICRC-3: Supported block types
+   icrc3_supported_block_types: () ->
+    (vec record {
+           block_type: text;
+           url: text;
+         }) query;
+   list_subaccounts: (owner: principal, start: opt blob) -> (vec blob) query;
+   set_fee_collector: (fc: opt Account) -> ();
+   status: () ->
+    (record {
+       index_synced: bool;
+       total_accounts: nat;
+       total_allowances: nat;
+       total_supply: nat;
+       total_transactions: nat;
+     }) query;
+ };
+type GetBlocksArgs = 
+ record {
+   length: nat;
+   start: nat;
+ };
+type GetAccountTransactionsResult = 
+ record {
+   balance: nat;
+   oldest_tx_id: opt nat;
+   transactions: vec Transaction;
+ };
+type GetAccountTransactionsArgs = 
+ record {
+   account: Account;
+   max_results: nat;
+   start: opt nat;
+ };
+type Block = 
+ record {
+   block: Value;
+   id: nat;
+ };
+type ApproveError = 
+ variant {
+   AllowanceChanged: record {current_allowance: nat;};
+   BadFee: record {expected_fee: nat;};
+   CreatedInFuture: record {ledger_time: nat64;};
+   Duplicate: record {duplicate_of: nat;};
+   Expired: record {ledger_time: nat64;};
+   GenericError: record {
+                   error_code: nat;
+                   message: text;
+                 };
+   InsufficientFunds: record {balance: nat;};
+   TemporarilyUnavailable;
+   TooOld;
+ };
+type ApproveArgs = 
+ record {
+   amount: nat;
+   created_at_time: opt nat64;
+   expected_allowance: opt nat;
+   expires_at: opt nat64;
+   fee: opt nat;
+   from_subaccount: opt blob;
+   memo: opt blob;
+   spender: Account;
+ };
+type AllowanceArgs = 
+ record {
+   account: Account;
+   spender: Account;
+ };
+type Allowance = 
+ record {
+   allowance: nat;
+   expires_at: opt nat64;
+ };
+type Account = 
+ record {
+   owner: principal;
+   subaccount: opt blob;
+ };
+/// IndexedLedger.mo — Self-Indexed ICRC-1/ICRC-2 Token Ledger (v2)
+/// 
+/// Refactored to use modular components:
+///   - Balances.mo (port of DFINITY balances.rs)
+///   - Allowances.mo (port of DFINITY approvals.rs)
+///   - BlockLog.mo (append-only log with hash chain + built-in account index)
+/// 
+/// FIRST ON ICP: Eliminates the separate index canister entirely.
+/// Every transfer atomically updates the account transaction index.
+service : (args: InitArgs) -> IndexedLedger

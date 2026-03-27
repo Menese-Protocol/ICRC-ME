@@ -1,0 +1,10 @@
+[package]
+name = "menese-clmm"
+version = "1.0.0"
+description = "Concentrated Liquidity Market Maker (CLMM) math library for Motoko — Q64.96 tick math, sqrt price calculations, swap step computation, and tick bitmap. Ported from Uniswap V3 core, verified against Raydium CLMM. Fixed rounding, fee wrapping, and precision bugs."
+repository = "https://github.com/Menese-Protocol/Menese-CLMM"
+keywords = ["clmm", "amm", "dex", "uniswap", "defi", "liquidity", "motoko", "icp"]
+
+[dependencies]
+core = "2.3.1"
+sha2 = "0.1.9"
