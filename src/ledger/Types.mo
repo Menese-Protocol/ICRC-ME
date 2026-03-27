@@ -189,27 +189,23 @@ module {
     (a.owner, sub)
   };
 
-  /// Serialize AccountKey to a fixed 34-byte blob for Region storage
-  /// Format: [principal_len:1][principal:≤29][padding:to 29][subaccount_hash:4]
+  /// Serialize AccountKey to a fixed 62-byte blob for Region storage.
+  /// Format: [principal_len:1][principal:29 padded][subaccount:32]
+  /// No hash; full subaccount stored; zero collision risk.
   public func accountKeyToBlob(key : AccountKey) : Blob {
     let pBlob = Principal.toBlob(key.0);
     let sub = key.1;
-    // FNV-1a hash of subaccount to 4 bytes
-    var h : Nat32 = 2166136261;
-    for (b in sub.vals()) {
-      h := h ^ Nat32.fromNat(Nat8.toNat(b));
-      h := h *% 16777619;
-    };
-    // Build 34-byte blob: [plen:1][principal:29][sub_hash:4]
-    Blob.fromArray(Array.tabulate<Nat8>(34, func(i) {
+    let pArr = Blob.toArray(pBlob);
+    let sArr = Blob.toArray(sub);
+    Blob.fromArray(Array.tabulate<Nat8>(62, func(i) {
       if (i == 0) Nat8.fromNat(pBlob.size())
       else if (i <= 29) {
-        if (i - 1 < pBlob.size()) Blob.toArray(pBlob)[i - 1] else 0
+        if (i - 1 < pArr.size()) pArr[i - 1] else 0
       }
-      else if (i == 30) Nat8.fromNat(Nat32.toNat(h / 16777216) % 256)
-      else if (i == 31) Nat8.fromNat(Nat32.toNat(h / 65536) % 256)
-      else if (i == 32) Nat8.fromNat(Nat32.toNat(h / 256) % 256)
-      else Nat8.fromNat(Nat32.toNat(h) % 256)
+      else {
+        let si = i - 30;
+        if (si < sArr.size()) sArr[si] else 0
+      }
     }))
   };
 

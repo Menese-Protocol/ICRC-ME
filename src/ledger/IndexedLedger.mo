@@ -70,13 +70,6 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   var circuitBreakerThreshold : Nat = 100_000_000_000;
   var circuitBreakerTripped : Bool = false;
 
-  // Per-caller rate limiting: reject callers exceeding maxCallsPerSecond.
-  // Transient — resets on upgrade; no penalty for honest users.
-  var callerLastCall = Map.empty<Principal, Nat>();
-  var callerCallCount = Map.empty<Principal, Nat>();
-  let maxCallsPerSecond : Nat = 10;
-  let rateLimitWindowNs : Nat = 1_000_000_000; // 1 second
-
   func guardCycles() : Bool {
     let bal = Cycles.balance();
     if (bal < circuitBreakerThreshold) {
@@ -85,29 +78,6 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     } else {
       if (circuitBreakerTripped) { circuitBreakerTripped := false };
       false
-    }
-  };
-
-  func guardRate(caller : Principal) : Bool {
-    if (Principal.isAnonymous(caller)) return true;
-    let now = Int.abs(Time.now());
-    let lastCall = switch (Map.get(callerLastCall, Principal.compare, caller)) {
-      case (?t) t; case null 0;
-    };
-    if (now > lastCall + rateLimitWindowNs) {
-      Map.add(callerLastCall, Principal.compare, caller, now);
-      Map.add(callerCallCount, Principal.compare, caller, 1);
-      false
-    } else {
-      let count = switch (Map.get(callerCallCount, Principal.compare, caller)) {
-        case (?c) c; case null 0;
-      };
-      if (count >= maxCallsPerSecond) {
-        true
-      } else {
-        Map.add(callerCallCount, Principal.compare, caller, count + 1);
-        false
-      }
     }
   };
 
@@ -221,7 +191,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // ═══════════════════════════════════════════════════════
 
   public shared ({ caller }) func icrc1_transfer(transferArgs : T.TransferArgs) : async { #Ok : Nat; #Err : T.TransferError } {
-    if (guardCycles() or guardRate(caller)) return #Err(#TemporarilyUnavailable);
+    if (guardCycles()) return #Err(#TemporarilyUnavailable);
 
     let from : T.Account = { owner = caller; subaccount = transferArgs.from_subaccount };
     let to = transferArgs.to;
@@ -282,7 +252,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // ═══════════════════════════════════════════════════════
 
   public shared ({ caller }) func icrc2_approve(approveArgs : T.ApproveArgs) : async { #Ok : Nat; #Err : T.ApproveError } {
-    if (guardCycles() or guardRate(caller)) return #Err(#TemporarilyUnavailable);
+    if (guardCycles()) return #Err(#TemporarilyUnavailable);
 
     let from : T.Account = { owner = caller; subaccount = approveArgs.from_subaccount };
     let spender = approveArgs.spender;
@@ -344,7 +314,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // ═══════════════════════════════════════════════════════
 
   public shared ({ caller }) func icrc2_transfer_from(tfArgs : T.TransferFromArgs) : async { #Ok : Nat; #Err : T.TransferFromError } {
-    if (guardCycles() or guardRate(caller)) return #Err(#TemporarilyUnavailable);
+    if (guardCycles()) return #Err(#TemporarilyUnavailable);
 
     let spender : T.Account = { owner = caller; subaccount = tfArgs.spender_subaccount };
     let from = tfArgs.from;

@@ -16,7 +16,6 @@ import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 import VarArray "mo:core/VarArray";
 import List "mo:core/List";
-import Map "mo:core/Map";
 import Text "mo:core/Text";
 import Time "mo:core/Time";
 import Principal "mo:core/Principal";
@@ -126,7 +125,6 @@ module {
   public type State = {
     var blockCount : Nat;
     var lastHash : ?Blob;
-    var subaccountMap : Map.Map<Principal, List.List<Blob>>;
     stableLog : SLog.State;
     mmr : MMR.State;
     regionIndex : RIdx.State;
@@ -136,7 +134,6 @@ module {
     {
       var blockCount = 0;
       var lastHash : ?Blob = null;
-      var subaccountMap = Map.empty<Principal, List.List<Blob>>();
       stableLog = SLog.newState();
       mmr = MMR.newState();
       regionIndex = RIdx.newState();
@@ -163,8 +160,6 @@ module {
     RIdx.addIndex(state.regionIndex, tx.from, idx);
     RIdx.addIndex(state.regionIndex, tx.to, idx);
     RIdx.addIndex(state.regionIndex, tx.spender, idx);
-    trackSub(state, tx.from);
-    trackSub(state, tx.to);
     idx
   };
 
@@ -369,24 +364,6 @@ module {
     };
   };
 
-  func trackSub(state : State, account : ?T.Account) {
-    switch (account) {
-      case (?a) {
-        let sub = switch (a.subaccount) { case (?s) s; case null "" : Blob };
-        let existing = switch (Map.get(state.subaccountMap, Principal.compare, a.owner)) {
-          case (?list) list; case null List.empty<Blob>();
-        };
-        var found = false;
-        for (s in List.values(existing)) { if (s == sub) found := true };
-        if (not found) {
-          List.add(existing, sub);
-          Map.add(state.subaccountMap, Principal.compare, a.owner, existing);
-        };
-      };
-      case null {};
-    };
-  };
-
   // ═══════════════════════════════════════════════════════
   //  INDEX QUERIES
   // ═══════════════════════════════════════════════════════
@@ -416,24 +393,8 @@ module {
   };
 
   public func listSubaccounts(state : State, owner : Principal, start : ?Blob) : [Blob] {
-    switch (Map.get(state.subaccountMap, Principal.compare, owner)) {
-      case (?list) {
-        let all = List.toArray(list);
-        switch (start) {
-          case null all;
-          case (?s) {
-            var found = false;
-            let result = List.empty<Blob>();
-            for (sub in all.vals()) {
-              if (found) { List.add(result, sub) };
-              if (sub == s) { found := true };
-            };
-            List.toArray(result)
-          };
-        };
-      };
-      case null [];
-    };
+    ignore start; // pagination not supported in Region scan; returns all
+    RIdx.listSubaccounts(state.regionIndex, owner, 1000)
   };
 
   // ═══════════════════════════════════════════════════════

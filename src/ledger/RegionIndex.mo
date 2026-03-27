@@ -13,19 +13,21 @@ import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
 import Blob "mo:core/Blob";
 import Array "mo:core/Array";
+import List "mo:core/List";
 import Region "mo:core/Region";
 import Runtime "mo:core/Runtime";
+import Principal "mo:core/Principal";
 
 import T "Types";
 
 module {
 
   let MAX_PER_ACCOUNT : Nat = 1000;
-  let NUM_BUCKETS : Nat64 = 65536;
-  let KEY_LEN : Nat64 = 34;
-  let SLOT_SIZE : Nat64 = 4042; // 34 + 4 + 4 + 4*1000
-  let BUCKET_BYTES : Nat64 = 5;  // [slot_idx:4][occupied:1]
-  let HT_BYTES : Nat64 = 327680; // 5 * 65536
+  let NUM_BUCKETS : Nat64 = 1048576;  // 2^20 = 1M buckets; <50% load at 500K accounts
+  let KEY_LEN : Nat64 = 62;           // full principal + full subaccount; zero collision
+  let SLOT_SIZE : Nat64 = 4070;       // 62 + 4 + 4 + 4*1000
+  let BUCKET_BYTES : Nat64 = 5;       // [slot_idx:4][occupied:1]
+  // HT total: 5 * 1048576 = 5,242,880 bytes = 81 pages
 
   public type State = {
     htRegion : Region.Region;
@@ -36,7 +38,7 @@ module {
   public func newState() : State {
     let ht = Region.new();
     let data = Region.new();
-    ignore Region.grow(ht, (HT_BYTES / 65536) + 1);
+    ignore Region.grow(ht, 81); // 81 pages = 5,242,880 bytes / 65536 + 1
     { htRegion = ht; dataRegion = data; var slotCount : Nat64 = 0 }
   };
 
@@ -97,7 +99,7 @@ module {
       let htOff = bucket * BUCKET_BYTES;
       if (Region.loadNat8(state.htRegion, htOff + 4) == 0) return null;
       let slot = Nat64.fromNat(Nat32.toNat(Region.loadNat32(state.htRegion, htOff))) * SLOT_SIZE;
-      if (Region.loadBlob(state.dataRegion, slot, 34) == kb) return ?slot;
+      if (Region.loadBlob(state.dataRegion, slot, 62) == kb) return ?slot;
       bucket := (bucket + 1) % NUM_BUCKETS;
       probes += 1;
     };
@@ -127,7 +129,7 @@ module {
         return slot;
       };
       let slot = Nat64.fromNat(Nat32.toNat(Region.loadNat32(state.htRegion, htOff))) * SLOT_SIZE;
-      if (Region.loadBlob(state.dataRegion, slot, 34) == kb) return slot;
+      if (Region.loadBlob(state.dataRegion, slot, 62) == kb) return slot;
       bucket := (bucket + 1) % NUM_BUCKETS;
       probes += 1;
     };
@@ -135,4 +137,30 @@ module {
   };
 
   public func accountCount(state : State) : Nat { Nat64.toNat(state.slotCount) };
+
+  /// Scan all slots for subaccounts belonging to a principal.
+  /// Extracts the subaccount (bytes 30–61) from each slot whose principal matches.
+  public func listSubaccounts(state : State, owner : Principal, maxResults : Nat) : [Blob] {
+    let pBlob = Principal.toBlob(owner);
+    let pLen = pBlob.size();
+    let results = List.empty<Blob>();
+    var i : Nat64 = 0;
+    var count = 0;
+    while (i < state.slotCount and count < maxResults) {
+      let slotOff = i * SLOT_SIZE;
+      // Check principal length byte matches
+      let storedPLen = Nat8.toNat(Region.loadNat8(state.dataRegion, slotOff));
+      if (storedPLen == pLen) {
+        let storedP = Region.loadBlob(state.dataRegion, slotOff + 1, pLen);
+        if (storedP == pBlob) {
+          // Extract subaccount (bytes 30–61)
+          let sub = Region.loadBlob(state.dataRegion, slotOff + 30, 32);
+          List.add(results, sub);
+          count += 1;
+        };
+      };
+      i += 1;
+    };
+    List.toArray(results)
+  };
 };
