@@ -22,12 +22,12 @@ import T "Types";
 
 module {
 
-  let MAX_PER_ACCOUNT : Nat = 1000;
-  let NUM_BUCKETS : Nat64 = 1048576;  // 2^20 = 1M buckets; <50% load at 500K accounts
+  let MAX_PER_ACCOUNT : Nat = 1000;    // ring buffer; full history always in StableLog
+  let NUM_BUCKETS : Nat64 = 16777216; // 2^24 = 16M buckets; <50% load at 8M accounts
   let KEY_LEN : Nat64 = 62;           // full principal + full subaccount; zero collision
   let SLOT_SIZE : Nat64 = 4070;       // 62 + 4 + 4 + 4*1000
   let BUCKET_BYTES : Nat64 = 5;       // [slot_idx:4][occupied:1]
-  // HT total: 5 * 1048576 = 5,242,880 bytes = 81 pages
+  // HT total: 5 * 16M = 80MB = 1280 pages
 
   public type State = {
     htRegion : Region.Region;
@@ -38,7 +38,8 @@ module {
   public func newState() : State {
     let ht = Region.new();
     let data = Region.new();
-    ignore Region.grow(ht, 81); // 81 pages = 5,242,880 bytes / 65536 + 1
+    let grown = Region.grow(ht, 1280); // 1280 pages = 80MB hash table
+    if (grown == 0xFFFF_FFFF_FFFF_FFFF) { Runtime.trap("RegionIndex: failed to allocate hash table") };
     { htRegion = ht; dataRegion = data; var slotCount : Nat64 = 0 }
   };
 
@@ -120,7 +121,10 @@ module {
         // Grow data region if needed
         let need = (slot + SLOT_SIZE) / 65536 + 1;
         let have = Region.size(state.dataRegion);
-        if (need > have) { ignore Region.grow(state.dataRegion, need - have) };
+        if (need > have) {
+          let g = Region.grow(state.dataRegion, need - have);
+          if (g == 0xFFFF_FFFF_FFFF_FFFF) { Runtime.trap("RegionIndex: stable memory exhausted") };
+        };
         // Write key
         Region.storeBlob(state.dataRegion, slot, kb);
         // Write HT entry

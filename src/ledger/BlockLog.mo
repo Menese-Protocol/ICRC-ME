@@ -101,15 +101,22 @@ module {
     digest.writeBlob(kindBytes);
     // Amount: variable-length big-endian
     natToBytes(digest, tx.amount);
-    // Accounts: principal bytes with presence flag
-    switch (tx.from) {
-      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
-      case null { digest.writeArray([0x00]) };
+    // Accounts: principal + subaccount with presence flags
+    func hashAccount(digest2 : Sha256.Digest, acc : ?T.Account) {
+      switch (acc) {
+        case (?a) {
+          digest2.writeArray([0x01]);
+          digest2.writeBlob(Principal.toBlob(a.owner));
+          switch (a.subaccount) {
+            case (?s) { digest2.writeArray([0x01]); digest2.writeBlob(s) };
+            case null { digest2.writeArray([0x00]) };
+          };
+        };
+        case null { digest2.writeArray([0x00]) };
+      };
     };
-    switch (tx.to) {
-      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
-      case null { digest.writeArray([0x00]) };
-    };
+    hashAccount(digest, tx.from);
+    hashAccount(digest, tx.to);
     // Fee: presence flag + variable-length
     switch (effectiveFee) {
       case (?f) { digest.writeArray([0x01]); natToBytes(digest, f) };
@@ -170,7 +177,7 @@ module {
   // ═══════════════════════════════════════════════════════
 
   func encodeBlock(_idx : Nat, parentHash : ?Blob, _hash : Blob, ts : Nat64, tx : T.Transaction, fee : ?Nat) : Blob {
-    let buf = VarArray.repeat<Nat8>(0, 256);
+    let buf = VarArray.repeat<Nat8>(0, 600); // max: 1+8+1+1+10+1+32+3*(1+29+1+32)+1+32+2+256+32 = ~530
     var len : Nat = 0;
     func w(b : Nat8) { buf[len] := b; len += 1 };
     func wBlob(b : Blob) { for (byte in b.vals()) { w(byte) } };
@@ -370,10 +377,10 @@ module {
 
   public func getAccountTransactions(state : State, account : T.Account, start : ?Nat, maxResults : Nat) : [T.Transaction] {
     let indices = RIdx.getIndices(state.regionIndex, account, Nat.min(maxResults, 100));
-    // indices are newest-first from RegionIndex; apply start filter
     let result = List.empty<T.Transaction>();
-    for (txIdx in indices.vals()) {
-      switch (start) { case (?s) { if (txIdx > s) { /* skip newer than start */ } else {} }; case null {} };
+    label scan for (txIdx in indices.vals()) {
+      // Skip indices newer than start
+      switch (start) { case (?s) { if (txIdx > s) { continue scan } }; case null {} };
       switch (SLog.get(state.stableLog, txIdx)) {
         case (?data) {
           switch (decodeBlock(txIdx, data)) {

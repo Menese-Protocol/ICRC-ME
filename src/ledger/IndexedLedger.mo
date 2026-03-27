@@ -146,13 +146,13 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
         let n = now();
         if (ts + TX_WINDOW_NS + PERMITTED_DRIFT_NS < n) return #TooOld;
         if (ts > n + PERMITTED_DRIFT_NS) return #InFuture(n);
-        // Bloom filter fast path: if definitely NOT seen, skip Map lookup entirely
+        // Bloom fast path (keyed on timestamp; false positives fall through to Map)
         if (not Bloom.mightContain(bloomState, ts, n)) {
           Bloom.add(bloomState, ts, n);
           Map.add(recentTxs, Nat64.compare, ts, BLog.length(blockState));
           return #ok;
         };
-        // Bloom says "maybe seen" — fall through to exact Map check
+        // Exact check: timestamp match means potential duplicate
         switch (Map.get(recentTxs, Nat64.compare, ts)) {
           case (?idx) #Duplicate(idx);
           case null {
@@ -168,6 +168,13 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   func validateMemo(memo : ?Blob) {
     switch (memo) {
       case (?m) { if (m.size() > maxMemoLength) Runtime.trap("Memo too long") };
+      case null {};
+    };
+  };
+
+  func validateSubaccount(sub : ?Blob) {
+    switch (sub) {
+      case (?s) { if (s.size() != 32) Runtime.trap("Subaccount must be 32 bytes") };
       case null {};
     };
   };
@@ -192,6 +199,8 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc1_transfer(transferArgs : T.TransferArgs) : async { #Ok : Nat; #Err : T.TransferError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
+    validateSubaccount(transferArgs.from_subaccount);
+    validateSubaccount(transferArgs.to.subaccount);
 
     let from : T.Account = { owner = caller; subaccount = transferArgs.from_subaccount };
     let to = transferArgs.to;
@@ -253,6 +262,8 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc2_approve(approveArgs : T.ApproveArgs) : async { #Ok : Nat; #Err : T.ApproveError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
+    validateSubaccount(approveArgs.from_subaccount);
+    validateSubaccount(approveArgs.spender.subaccount);
 
     let from : T.Account = { owner = caller; subaccount = approveArgs.from_subaccount };
     let spender = approveArgs.spender;
@@ -315,6 +326,9 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc2_transfer_from(tfArgs : T.TransferFromArgs) : async { #Ok : Nat; #Err : T.TransferFromError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
+    validateSubaccount(tfArgs.spender_subaccount);
+    validateSubaccount(tfArgs.from.subaccount);
+    validateSubaccount(tfArgs.to.subaccount);
 
     let spender : T.Account = { owner = caller; subaccount = tfArgs.spender_subaccount };
     let from = tfArgs.from;
@@ -349,15 +363,42 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       };
     };
 
-    // Execute transfer
+    // Handle burn (to == minting), mint (from == minting), or regular transfer
+    let isBurn = isMintingAccount(to);
+    let isMint = isMintingAccount(from);
+
+    if (isBurn) {
+      // Burn: fee must be 0 for burns
+      switch (Bal.burn(balState, from, amount)) {
+        case (#err(#InsufficientFunds({ balance }))) {
+          switch (savedAllowance) {
+            case (?saved) { ignore Allow.approve(allowState, from, spender, saved.allowance, saved.expires_at, null) };
+            case null {};
+          };
+          return #Err(#InsufficientFunds({ balance }));
+        };
+        case (#ok(())) {};
+      };
+      let tx = makeTx("burn", ?from, null, ?spender, amount, null, tfArgs.memo);
+      let idx = appendAndCertify(tx, null);
+      return #Ok(idx);
+    };
+
+    if (isMint) {
+      switch (Bal.mint(balState, to, amount)) {
+        case (#err(_)) return #Err(#GenericError({ error_code = 1; message = "Mint exceeds supply" }));
+        case (#ok(())) {};
+      };
+      let tx = makeTx("mint", null, ?to, ?spender, amount, null, tfArgs.memo);
+      let idx = appendAndCertify(tx, null);
+      return #Ok(idx);
+    };
+
+    // Regular transfer
     switch (Bal.transfer(balState, from, to, amount, fee, feeCollector)) {
       case (#err(#InsufficientFunds({ balance }))) {
-        // Restore allowance to exact pre-decrement state
         switch (savedAllowance) {
-          case (?saved) {
-            ignore Allow.approve(allowState, from, spender,
-              saved.allowance, saved.expires_at, null);
-          };
+          case (?saved) { ignore Allow.approve(allowState, from, spender, saved.allowance, saved.expires_at, null) };
           case null {};
         };
         return #Err(#InsufficientFunds({ balance }));
