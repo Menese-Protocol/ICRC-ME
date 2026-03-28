@@ -26,7 +26,7 @@ import T "Types";
 import SLog "StableLog";
 import CBOR "CBOR";
 import MMR "MerkleMMR";
-import CIdx "CompactIndex";
+import CIdx "BTreeIndex";
 
 module {
 
