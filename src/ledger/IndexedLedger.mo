@@ -730,7 +730,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // ═══════════════════════════════════════════════════════
 
   type ArchiveQueryInterface = actor {
-    icrc3_get_blocks_query : shared query [{ start : Nat; length : Nat }] -> async {
+    icrc3_get_blocks : shared query [{ start : Nat; length : Nat }] -> async {
       blocks : [T.Block];
       log_length : Nat;
     };
@@ -771,7 +771,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       // Find the idx-th matching archive
       var matched : Nat = 0;
       var result : ArchiveCallback = {
-        args = []; callback = (actor("aaaaa-aa") : ArchiveQueryInterface).icrc3_get_blocks_query;
+        args = []; callback = (actor("aaaaa-aa") : ArchiveQueryInterface).icrc3_get_blocks;
       };
       label scan for (a in archives.vals()) {
         if (args.start <= a.lastBlock and requestedEnd > a.firstBlock) {
@@ -781,7 +781,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
             let archiveActor : ArchiveQueryInterface = actor (Principal.toText(a.canisterId));
             result := {
               args = [{ start = overlapStart; length = overlapEnd - overlapStart }];
-              callback = archiveActor.icrc3_get_blocks_query;
+              callback = archiveActor.icrc3_get_blocks;
             };
             break scan;
           };

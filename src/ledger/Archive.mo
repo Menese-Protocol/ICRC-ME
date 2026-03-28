@@ -1,7 +1,5 @@
 /// Archive.mo — Read-only archive canister for overflow blocks
 ///
-/// Port of dfinity/ic rs/ledger_suite/icrc1/archive/src/main.rs
-///
 /// When the main ledger's block log exceeds a threshold, it spawns
 /// an Archive canister and moves old blocks there. The archive is
 /// a simple read-only store — it only accepts blocks from the ledger principal.
@@ -10,16 +8,18 @@
 ///   - StableLog-backed (Region) — same as main ledger
 ///   - Only the parent ledger can append blocks
 ///   - Exposes get_blocks query for external tools
-///   - ICRC-3 compatible: icrc3_get_blocks
+///   - ICRC-3 compatible: icrc3_get_blocks returns Value (decoded CBOR)
+///   - icrc3_get_blocks also serves as the callback for icrc3_get_transactions
 
 import Principal "mo:core/Principal";
 import Nat "mo:core/Nat";
-import Nat64 "mo:core/Nat64";
 import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 import Runtime "mo:core/Runtime";
 
 import SLog "StableLog";
+import CBOR "CBOR";
+import T "Types";
 
 shared(initMsg) persistent actor class Archive(ledgerPrincipal : Principal) {
 
@@ -44,7 +44,7 @@ shared(initMsg) persistent actor class Archive(ledgerPrincipal : Principal) {
     count
   };
 
-  /// Get blocks by index range (absolute indices).
+  /// Get raw blocks by index range (absolute indices).
   public query func get_blocks(start : Nat, length : Nat) : async {
     blocks : [Blob];
     first_index : Nat;
@@ -58,33 +58,43 @@ shared(initMsg) persistent actor class Archive(ledgerPrincipal : Principal) {
 
     if (localStart >= totalBlocks) return { blocks = []; first_index = blockOffset; length = 0 };
 
-    let result = Array.tabulate<Blob>(localEnd - localStart, func(i) {
+    let result = Array.tabulate<Blob>(localEnd - localStart : Nat, func(i) {
       switch (SLog.get(logState, localStart + i)) {
         case (?b) b;
-        case null Blob.fromArray([]);
+        case null "" : Blob;
       };
     });
 
     { blocks = result; first_index = blockOffset + localStart; length = result.size() }
   };
 
-  /// ICRC-3 compatible block access
+  /// Decode a raw CBOR block blob into a Value.
+  /// Falls back to wrapping the raw blob if decoding fails.
+  func blobToValue(data : Blob) : T.Value {
+    switch (CBOR.decodeValue(data)) {
+      case (?v) v;
+      case null #Blob(data); // fallback: return raw blob if CBOR decode fails
+    };
+  };
+
+  /// ICRC-3 compatible block access — returns decoded Value types.
+  /// This function serves as the callback for icrc3_get_transactions.
   public query func icrc3_get_blocks(args : [{ start : Nat; length : Nat }]) : async {
-    blocks : [{ id : Nat; block : Blob }];
+    blocks : [T.Block];
     log_length : Nat;
   } {
-    var allBlocks : [{ id : Nat; block : Blob }] = [];
     let totalBlocks = SLog.size(logState);
+    var allBlocks : [T.Block] = [];
 
     for (range in args.vals()) {
       let localStart = if (range.start >= blockOffset) { range.start - blockOffset } else { 0 };
       let localEnd = Nat.min(localStart + range.length, totalBlocks);
 
       if (localStart < totalBlocks) {
-        let batch = Array.tabulate<{ id : Nat; block : Blob }>(localEnd - localStart, func(i) {
+        let batch = Array.tabulate<T.Block>(localEnd - localStart : Nat, func(i) {
           let idx = localStart + i;
           let data = switch (SLog.get(logState, idx)) { case (?b) b; case null "" : Blob };
-          { id = blockOffset + idx; block = data }
+          { id = blockOffset + idx; block = blobToValue(data) }
         });
         allBlocks := Array.concat(allBlocks, batch);
       };
@@ -97,12 +107,12 @@ shared(initMsg) persistent actor class Archive(ledgerPrincipal : Principal) {
   public query func info() : async {
     first_index : Nat;
     block_count : Nat;
-    data_size : Nat;
+    parent_ledger : Principal;
   } {
     {
       first_index = blockOffset;
       block_count = SLog.size(logState);
-      data_size = SLog.dataSize(logState);
+      parent_ledger = parentLedger;
     }
   };
 };

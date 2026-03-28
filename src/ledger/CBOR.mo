@@ -18,8 +18,8 @@ import Int "mo:core/Int";
 import Blob "mo:core/Blob";
 import Text "mo:core/Text";
 import Array "mo:core/Array";
-import VarArray "mo:core/VarArray";
 import List "mo:core/List";
+import VarArray "mo:core/VarArray";
 import Principal "mo:core/Principal";
 
 module {
@@ -141,7 +141,7 @@ module {
   // ═══════════════════════════════════════════════════════
 
   public class Reader(data : [Nat8]) {
-    var pos : Nat = 0;
+    public var pos : Nat = 0;
 
     public func remaining() : Nat {
       if (pos >= data.size()) 0 else data.size() - pos;
@@ -324,6 +324,96 @@ module {
     let w = Writer();
     encodeValueInner(w, v);
     w.toBlob()
+  };
+
+  /// Decode CBOR bytes back into an ICRC-3 Value.
+  /// Handles tag 55799 (self-describe CBOR), maps, arrays, text, blob, nat, int.
+  public func decodeValue(data : Blob) : ?Value {
+    let r = Reader(Blob.toArray(data));
+    // Skip self-describe tag 55799 if present
+    let saved = r.pos;
+    switch (r.decodeTag()) {
+      case (?55799) {}; // consumed
+      case _ { r.pos := saved }; // not a tag, rewind
+    };
+    decodeValueInner(r, 0);
+  };
+
+  func decodeValueInner(r : Reader, depth : Nat) : ?Value {
+    if (depth > 64) return null; // prevent infinite recursion
+    switch (r.decodeHead()) {
+      // Major 0: unsigned integer
+      case (?(0, n)) ?#Nat(n);
+      // Major 1: negative integer → Int
+      case (?(1, n)) ?#Int(-(n + 1));
+      // Major 2: byte string
+      case (?(2, len)) {
+        switch (r.readBytes(len)) {
+          case (?bs) ?#Blob(Blob.fromArray(bs));
+          case null null;
+        };
+      };
+      // Major 3: text string
+      case (?(3, len)) {
+        switch (r.readBytes(len)) {
+          case null null;
+          case (?bs) {
+            switch (Text.decodeUtf8(Blob.fromArray(bs))) {
+              case (?t) ?#Text(t);
+              case null null;
+            };
+          };
+        };
+      };
+      // Major 4: array
+      case (?(4, len)) {
+        let items = List.empty<Value>();
+        var i = 0;
+        while (i < len) {
+          switch (decodeValueInner(r, depth + 1)) {
+            case (?v) { List.add(items, v) };
+            case null return null;
+          };
+          i += 1;
+        };
+        ?#Array(List.toArray(items));
+      };
+      // Major 5: map
+      case (?(5, len)) {
+        let entries = List.empty<(Text, Value)>();
+        var i = 0;
+        while (i < len) {
+          let keyHead = r.decodeHead();
+          let key = switch (keyHead) {
+            case (?(3, klen)) {
+              switch (r.readBytes(klen)) {
+                case null return null;
+                case (?bs) {
+                  switch (Text.decodeUtf8(Blob.fromArray(bs))) {
+                    case (?t) t;
+                    case null return null;
+                  };
+                };
+              };
+            };
+            case _ return null;
+          };
+          switch (decodeValueInner(r, depth + 1)) {
+            case (?v) { List.add(entries, (key, v)) };
+            case null return null;
+          };
+          i += 1;
+        };
+        ?#Map(List.toArray(entries));
+      };
+      // Major 6: tag (nested)
+      case (?(6, _tag)) decodeValueInner(r, depth + 1);
+      // Major 7: simple values (true, false, null, etc.)
+      case (?(7, 20)) ?#Nat(0); // false
+      case (?(7, 21)) ?#Nat(1); // true
+      case (?(7, 22)) ?#Nat(0); // null
+      case _ null;
+    };
   };
 
   func encodeValueInner(w : Writer, v : Value) {
