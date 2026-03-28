@@ -21,6 +21,7 @@ import Map "mo:core/Map";
 import Time "mo:core/Time";
 import Timer "mo:core/Timer";
 import Cycles "mo:core/Cycles";
+import Error "mo:core/Error";
 
 import Array "mo:core/Array";
 
@@ -844,34 +845,39 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     archiveInProgress := true;
 
-    // Spawn new Archive canister
-    let archive = await (with cycles = archiveCycles) Archive.Archive(Principal.fromActor(self));
-    let archiveId = Principal.fromActor(archive);
+    try {
+      // Spawn new Archive canister
+      let archive = await (with cycles = archiveCycles) Archive.Archive(Principal.fromActor(self));
+      let archiveId = Principal.fromActor(archive);
 
-    let migrateStart = localBlockOffset;
-    let migrateEnd = totalBlocks - retainCount;
+      let migrateStart = localBlockOffset;
+      let migrateEnd = totalBlocks - retainCount;
 
-    await archive.init(migrateStart);
+      await archive.init(migrateStart);
 
-    // Migrate blocks in batches
-    var pos = migrateStart;
-    while (pos < migrateEnd) {
-      let batchEnd = Nat.min(pos + archiveBatchSize, migrateEnd);
-      let batch = BLog.getRawBlobs(blockState, pos - localBlockOffset, batchEnd - pos);
-      ignore await archive.appendBlocks(batch);
-      pos := batchEnd;
-    };
+      // Migrate blocks in batches
+      var pos = migrateStart;
+      while (pos < migrateEnd) {
+        let batchEnd = Nat.min(pos + archiveBatchSize, migrateEnd);
+        let batch = BLog.getRawBlobs(blockState, pos - localBlockOffset, batchEnd - pos);
+        ignore await archive.appendBlocks(batch);
+        pos := batchEnd;
+      };
 
-    // Update registry
-    let entry : ArchiveEntry = { canisterId = archiveId; firstBlock = migrateStart; lastBlock = migrateEnd - 1 };
-    let newArchives = Array.tabulate<ArchiveEntry>(archives.size() + 1, func(i) {
-      if (i < archives.size()) archives[i] else entry
-    });
-    archives := newArchives;
-    localBlockOffset := migrateEnd;
-    archiveInProgress := false;
+      // Update registry
+      let entry : ArchiveEntry = { canisterId = archiveId; firstBlock = migrateStart; lastBlock = migrateEnd - 1 };
+      let newArchives = Array.tabulate<ArchiveEntry>(archives.size() + 1, func(i) {
+        if (i < archives.size()) archives[i] else entry
+      });
+      archives := newArchives;
+      localBlockOffset := migrateEnd;
+      archiveInProgress := false;
 
-    #ok(archiveId)
+      #ok(archiveId)
+    } catch (e) {
+      archiveInProgress := false;
+      #err("Archive failed: " # Error.message(e))
+    }
   };
 
   /// Query archive status
