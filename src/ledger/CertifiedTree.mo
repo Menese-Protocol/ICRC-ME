@@ -18,7 +18,6 @@
 import Blob "mo:core/Blob";
 import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
-import Nat64 "mo:core/Nat64";
 import Array "mo:core/Array";
 import Text "mo:core/Text";
 import CertifiedData "mo:core/CertifiedData";
@@ -60,23 +59,24 @@ module {
     #pruned : Blob;
   };
 
-  /// Compute hash of a hash tree node (IC spec: domain separator + recursive hashing)
+  /// Compute hash of a hash tree node (IC spec §3.2: domain separator strings)
+  /// See https://internetcomputer.org/docs/references/ic-interface-spec/#hash-tree
   public func hashTree(tree : HashTree) : Blob {
     switch (tree) {
       case (#empty) {
-        Sha256.fromBlob(#sha256, Blob.fromArray([0x11])) // domain_sep("ic-hashtree-empty")
+        Sha256.fromBlob(#sha256, Text.encodeUtf8("ic-hashtree-empty"))
       };
       case (#fork(left, right)) {
         let lHash = hashTree(left);
         let rHash = hashTree(right);
-        hashConcat([0x10], [lHash, rHash]) // domain_sep("ic-hashtree-fork")
+        hashDomainConcat("ic-hashtree-fork", [lHash, rHash])
       };
       case (#labeled(lbl, subtree)) {
         let subHash = hashTree(subtree);
-        hashConcat([0x13], [lbl, subHash]) // domain_sep("ic-hashtree-labeled")
+        hashDomainConcat("ic-hashtree-labeled", [lbl, subHash])
       };
       case (#leaf(data)) {
-        hashConcat([0x12], [data]) // domain_sep("ic-hashtree-leaf")
+        hashDomainConcat("ic-hashtree-leaf", [data])
       };
       case (#pruned(hash)) {
         hash // Already a hash
@@ -84,9 +84,9 @@ module {
     };
   };
 
-  func hashConcat(domainSep : [Nat8], parts : [Blob]) : Blob {
+  func hashDomainConcat(domain : Text, parts : [Blob]) : Blob {
     let digest = Sha256.Digest(#sha256);
-    digest.writeArray(domainSep);
+    digest.writeBlob(Text.encodeUtf8(domain));
     for (p in parts.vals()) { digest.writeBlob(p) };
     digest.sum()
   };
@@ -150,8 +150,19 @@ module {
   //  CERTIFIED LEDGER STATE OPERATIONS
   // ═══════════════════════════════════════════════════════
 
+  /// Encode Nat as big-endian bytes (LEB128-like: minimal encoding)
+  func natToBeBytes(n : Nat) : Blob {
+    if (n == 0) return Blob.fromArray([0]);
+    var tmp = n;
+    var bc : Nat = 0;
+    while (tmp > 0) { tmp /= 256; bc += 1 };
+    Blob.fromArray(Array.tabulate<Nat8>(bc, func(i) {
+      Nat8.fromNat((n / (256 ** (bc - 1 - i))) % 256)
+    }))
+  };
+
   func buildTipTree(blockIndex : Nat, blockHash : Blob) : HashTree {
-    let indexBlob = Text.encodeUtf8(Nat.toText(blockIndex));
+    let indexBlob = natToBeBytes(blockIndex);
     #labeled(
       Text.encodeUtf8("tip"),
       #fork(

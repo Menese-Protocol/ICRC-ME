@@ -394,8 +394,7 @@ module {
   };
 
   public func getOldestTxId(state : State, account : T.Account) : ?Nat {
-    let indices = CIdx.getIndices(state.compactIndex, account, 1000);
-    if (indices.size() == 0) null else ?indices[indices.size() - 1]
+    CIdx.getOldestIndex(state.compactIndex, account)
   };
 
   public func listSubaccounts(state : State, owner : Principal, start : ?Blob) : [Blob] {
@@ -417,10 +416,17 @@ module {
         case (?data) {
           switch (decodeBlock(i, data)) {
             case (?decoded) {
+              // Recompute hash using same structured preimage as append()
+              let hash = computeBlockHash(
+                decoded.parentHash,
+                decoded.tx.timestamp,
+                decoded.tx,
+                decoded.tx.fee,
+              );
               List.add(result, {
                 index = i;
                 parentHash = decoded.parentHash;
-                hash = Sha256.fromBlob(#sha256, data);
+                hash;
                 timestamp = decoded.tx.timestamp;
                 transaction = decoded.tx;
                 effectiveFee = decoded.tx.fee;

@@ -229,25 +229,46 @@ module {
     };
   };
 
+  /// Get the oldest (first) transaction index for an account. O(1) via the raw block.
+  public func getOldestIndex(state : State, account : T.Account) : ?Nat {
+    let kb = T.accountKeyToBlob(T.accountKey(account));
+    switch (BTree.get(state.btree, kb)) {
+      case null null;
+      case (?val) {
+        let (_, head) = decodeValue(val);
+        // The first block's first entry is the oldest tx index
+        let capCode = Nat8.toNat(Region.loadNat8(state.blockRegion, head + 7));
+        if (capCode < 4) {
+          let bCount = Nat8.toNat(Region.loadNat8(state.blockRegion, head + 6));
+          if (bCount > 0) {
+            ?Nat32.toNat(Region.loadNat32(state.blockRegion, head + BLOCK_HEADER))
+          } else null;
+        } else {
+          let indices = deltaReadAll(state, head);
+          if (indices.size() > 0) ?indices[0] else null;
+        };
+      };
+    };
+  };
+
   public func accountCount(state : State) : Nat { BTree.size(state.btree) };
 
   public func listSubaccounts(state : State, owner : Principal, maxResults : Nat) : [Blob] {
+    // Build prefix: [principal_len:1][principal:padded_to_29]
+    // This matches the first 30 bytes of accountKeyToBlob format
     let pBlob = Principal.toBlob(owner);
-    let pLen = pBlob.size();
+    let pArr = Blob.toArray(pBlob);
+    let prefix = Blob.fromArray(Array.tabulate<Nat8>(30, func(i) {
+      if (i == 0) Nat8.fromNat(pBlob.size())
+      else if (i <= 29) { if (i - 1 < pArr.size()) pArr[i - 1] else 0 }
+      else 0
+    }));
+    // Use B-tree prefix scan — O(k log n) instead of O(n)
+    let entries = BTree.prefixScan(state.btree, prefix, maxResults);
     let results = List.empty<Blob>();
-    var count = 0;
-    for ((key, _) in BTree.entries(state.btree).vals()) {
-      if (count >= maxResults) return List.toArray(results);
+    for ((key, _) in entries.vals()) {
       let kb = Blob.toArray(key);
-      if (Nat8.toNat(kb[0]) == pLen) {
-        var match = true; var i = 0;
-        let pa = Blob.toArray(pBlob);
-        while (i < pLen and match) { if (kb[1 + i] != pa[i]) match := false; i += 1 };
-        if (match) {
-          List.add(results, Blob.fromArray(Array.tabulate<Nat8>(32, func(j) { kb[30 + j] })));
-          count += 1;
-        };
-      };
+      List.add(results, Blob.fromArray(Array.tabulate<Nat8>(32, func(j) { kb[30 + j] })));
     };
     List.toArray(results)
   };

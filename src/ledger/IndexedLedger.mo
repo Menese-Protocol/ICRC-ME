@@ -24,6 +24,10 @@ import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
 import Cycles "mo:core/Cycles";
 
+import Array "mo:core/Array";
+
+import Sha256 "mo:sha2/Sha256";
+
 import T "Types";
 import Bal "Balances";
 import Allow "Allowances";
@@ -81,11 +85,46 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     }
   };
 
-  // Dedup: Bloom filter (O(1) fast path) + Map (exact fallback)
-  var recentTxs = Map.empty<Nat64, Nat>();
+  // Dedup: keyed on (caller_principal, created_at_time, amount, memo_hash) to
+  // avoid false collisions between different users or different transactions.
+  // Bloom filter provides O(1) fast-path; Map is exact fallback.
   var bloomState : Bloom.State = Bloom.newState(86_400_000_000_000); // 24h window
   let TX_WINDOW_NS : Nat64 = 86_400_000_000_000;
   let PERMITTED_DRIFT_NS : Nat64 = 60_000_000_000;
+
+  /// Build a dedup key from (caller, timestamp, amount, memo).
+  /// SHA256 ensures fixed-size key for Map and Bloom filter.
+  func buildDedupKey(caller : Principal, ts : Nat64, amount : Nat, memo : ?Blob) : Blob {
+    let digest = Sha256.Digest(#sha256);
+    digest.writeBlob(Principal.toBlob(caller));
+    // Timestamp as 8-byte big-endian
+    let tsN = Nat64.toNat(ts);
+    digest.writeArray([
+      Nat8.fromNat((tsN / 72057594037927936) % 256),
+      Nat8.fromNat((tsN / 281474976710656) % 256),
+      Nat8.fromNat((tsN / 1099511627776) % 256),
+      Nat8.fromNat((tsN / 4294967296) % 256),
+      Nat8.fromNat((tsN / 16777216) % 256),
+      Nat8.fromNat((tsN / 65536) % 256),
+      Nat8.fromNat((tsN / 256) % 256),
+      Nat8.fromNat(tsN % 256),
+    ]);
+    // Amount as variable-length big-endian
+    if (amount == 0) { digest.writeArray([0]) } else {
+      var tmp = amount; var bc : Nat = 0;
+      while (tmp > 0) { tmp /= 256; bc += 1 };
+      let bytes = Array.tabulate<Nat8>(bc, func(i) {
+        Nat8.fromNat((amount / (256 ** (bc - 1 - i))) % 256)
+      });
+      digest.writeArray(bytes);
+    };
+    // Memo (presence flag + content)
+    switch (memo) {
+      case (?m) { digest.writeArray([0x01]); digest.writeBlob(m) };
+      case null { digest.writeArray([0x00]) };
+    };
+    digest.sum()
+  };
 
   // ═══════════════════════════════════════════════════════
   //  INIT — Process initial balances (first install only)
@@ -117,28 +156,32 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   func now() : Nat64 { Nat64.fromNat(Int.abs(Time.now())) };
 
+  // Dedup entries store (dedupKey -> (blockIndex, timestamp)) so we can prune by age.
+  type DedupEntry = { blockIndex : Nat; timestamp : Nat64 };
+  var recentTxEntries = Map.empty<Blob, DedupEntry>();
+
   // Prune up to 20 expired entries per call (amortized GC)
   var dedupPruneCounter : Nat = 0;
   func pruneDedupMap() {
     dedupPruneCounter += 1;
-    if (dedupPruneCounter % 10 != 0) return; // prune every 10th call
+    if (dedupPruneCounter % 10 != 0) return;
     let n = now();
-    let cutoff = n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000; // 1 min margin
-    let toDelete = List.empty<Nat64>();
+    let cutoff = n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000;
+    let toDelete = List.empty<Blob>();
     var count : Nat = 0;
-    for ((ts, _) in Map.entries(recentTxs)) {
+    for ((key, entry) in Map.entries(recentTxEntries)) {
       if (count >= 20) return;
-      if (ts < cutoff) {
-        List.add(toDelete, ts);
+      if (entry.timestamp < cutoff) {
+        List.add(toDelete, key);
         count += 1;
       };
     };
-    for (ts in List.values(toDelete)) {
-      ignore Map.delete(recentTxs, Nat64.compare, ts);
+    for (key in List.values(toDelete)) {
+      ignore Map.delete(recentTxEntries, Blob.compare, key);
     };
   };
 
-  func checkDedupAndTime(created_at_time : ?Nat64) : { #ok; #TooOld; #InFuture : Nat64; #Duplicate : Nat } {
+  func checkDedupAndTime(caller : Principal, created_at_time : ?Nat64, amount : Nat, memo : ?Blob) : { #ok; #TooOld; #InFuture : Nat64; #Duplicate : Nat } {
     pruneDedupMap();
     switch (created_at_time) {
       case null #ok;
@@ -146,18 +189,19 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
         let n = now();
         if (ts + TX_WINDOW_NS + PERMITTED_DRIFT_NS < n) return #TooOld;
         if (ts > n + PERMITTED_DRIFT_NS) return #InFuture(n);
-        // Bloom fast path (keyed on timestamp; false positives fall through to Map)
+        let dedupKey = buildDedupKey(caller, ts, amount, memo);
+        // Bloom fast path (keyed on timestamp for window; dedupKey for exact match)
         if (not Bloom.mightContain(bloomState, ts, n)) {
           Bloom.add(bloomState, ts, n);
-          Map.add(recentTxs, Nat64.compare, ts, BLog.length(blockState));
+          Map.add(recentTxEntries, Blob.compare, dedupKey, { blockIndex = BLog.length(blockState); timestamp = ts });
           return #ok;
         };
-        // Exact check: timestamp match means potential duplicate
-        switch (Map.get(recentTxs, Nat64.compare, ts)) {
-          case (?idx) #Duplicate(idx);
+        // Exact check with full dedup key
+        switch (Map.get(recentTxEntries, Blob.compare, dedupKey)) {
+          case (?entry) #Duplicate(entry.blockIndex);
           case null {
             Bloom.add(bloomState, ts, n);
-            Map.add(recentTxs, Nat64.compare, ts, BLog.length(blockState));
+            Map.add(recentTxEntries, Blob.compare, dedupKey, { blockIndex = BLog.length(blockState); timestamp = ts });
             #ok
           };
         };
@@ -165,17 +209,17 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     };
   };
 
-  func validateMemo(memo : ?Blob) {
+  func validateMemo(memo : ?Blob) : ?Text {
     switch (memo) {
-      case (?m) { if (m.size() > maxMemoLength) Runtime.trap("Memo too long") };
-      case null {};
+      case (?m) { if (m.size() > maxMemoLength) ?("Memo too long: " # Nat.toText(m.size()) # " > " # Nat.toText(maxMemoLength)) else null };
+      case null null;
     };
   };
 
-  func validateSubaccount(sub : ?Blob) {
+  func validateSubaccount(sub : ?Blob) : ?Text {
     switch (sub) {
-      case (?s) { if (s.size() != 32) Runtime.trap("Subaccount must be 32 bytes") };
-      case null {};
+      case (?s) { if (s.size() != 32) ?("Subaccount must be 32 bytes, got " # Nat.toText(s.size())) else null };
+      case null null;
     };
   };
 
@@ -199,8 +243,12 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc1_transfer(transferArgs : T.TransferArgs) : async { #Ok : Nat; #Err : T.TransferError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
-    validateSubaccount(transferArgs.from_subaccount);
-    validateSubaccount(transferArgs.to.subaccount);
+    switch (validateSubaccount(transferArgs.from_subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
+    switch (validateSubaccount(transferArgs.to.subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
 
     let from : T.Account = { owner = caller; subaccount = transferArgs.from_subaccount };
     let to = transferArgs.to;
@@ -215,17 +263,20 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       case null expectedFee;
     };
 
-    validateMemo(transferArgs.memo);
+    switch (validateMemo(transferArgs.memo)) {
+      case (?e) return #Err(#GenericError({ error_code = 101; message = e })); case null {};
+    };
 
-    switch (checkDedupAndTime(transferArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, transferArgs.created_at_time, amount, transferArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
       case (#ok) {};
     };
 
-    // Burn
+    // Burn — enforce min_burn_amount
     if (isMintingAccount(to)) {
+      if (amount == 0) return #Err(#BadBurn({ min_burn_amount = 1 }));
       switch (Bal.burn(balState, from, amount + fee)) {
         case (#err(#InsufficientFunds({ balance }))) return #Err(#InsufficientFunds({ balance }));
         case (#ok(())) {};
@@ -262,8 +313,12 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc2_approve(approveArgs : T.ApproveArgs) : async { #Ok : Nat; #Err : T.ApproveError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
-    validateSubaccount(approveArgs.from_subaccount);
-    validateSubaccount(approveArgs.spender.subaccount);
+    switch (validateSubaccount(approveArgs.from_subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
+    switch (validateSubaccount(approveArgs.spender.subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
 
     let from : T.Account = { owner = caller; subaccount = approveArgs.from_subaccount };
     let spender = approveArgs.spender;
@@ -283,9 +338,11 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       case null tokenFee;
     };
 
-    validateMemo(approveArgs.memo);
+    switch (validateMemo(approveArgs.memo)) {
+      case (?e) return #Err(#GenericError({ error_code = 101; message = e })); case null {};
+    };
 
-    switch (checkDedupAndTime(approveArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, approveArgs.created_at_time, approveArgs.amount, approveArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
@@ -326,23 +383,35 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   public shared ({ caller }) func icrc2_transfer_from(tfArgs : T.TransferFromArgs) : async { #Ok : Nat; #Err : T.TransferFromError } {
     if (guardCycles()) return #Err(#TemporarilyUnavailable);
-    validateSubaccount(tfArgs.spender_subaccount);
-    validateSubaccount(tfArgs.from.subaccount);
-    validateSubaccount(tfArgs.to.subaccount);
+    switch (validateSubaccount(tfArgs.spender_subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
+    switch (validateSubaccount(tfArgs.from.subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
+    switch (validateSubaccount(tfArgs.to.subaccount)) {
+      case (?e) return #Err(#GenericError({ error_code = 100; message = e })); case null {};
+    };
 
     let spender : T.Account = { owner = caller; subaccount = tfArgs.spender_subaccount };
     let from = tfArgs.from;
     let to = tfArgs.to;
     let amount = tfArgs.amount;
 
+    // Burns and mints have fee = 0; regular transfers use tokenFee
+    let isBurnTf = isMintingAccount(to);
+    let isMintTf = isMintingAccount(from);
+    let expectedFeeTf : Nat = if (isBurnTf or isMintTf) 0 else tokenFee;
     let fee = switch (tfArgs.fee) {
-      case (?f) { if (f != tokenFee) return #Err(#BadFee({ expected_fee = tokenFee })); f };
-      case null tokenFee;
+      case (?f) { if (f != expectedFeeTf) return #Err(#BadFee({ expected_fee = expectedFeeTf })); f };
+      case null expectedFeeTf;
     };
 
-    validateMemo(tfArgs.memo);
+    switch (validateMemo(tfArgs.memo)) {
+      case (?e) return #Err(#GenericError({ error_code = 101; message = e })); case null {};
+    };
 
-    switch (checkDedupAndTime(tfArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, tfArgs.created_at_time, amount, tfArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
@@ -432,6 +501,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       ("icrc1:symbol", #Text(tokenSymbol)),
       ("icrc1:decimals", #Nat(Nat8.toNat(tokenDecimals))),
       ("icrc1:fee", #Nat(tokenFee)),
+      ("icrc1:max_memo_length", #Nat(maxMemoLength)),
     ]
   };
 
@@ -532,6 +602,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     };
 
     let txFields = List.empty<(Text, T.Value)>();
+    List.add(txFields, ("idx", #Nat(b.index)));
     List.add(txFields, ("amt", #Nat(b.transaction.amount)));
     switch (b.transaction.from) {
       case (?a) { List.add(txFields, ("from", accountToValue(a))) };
@@ -573,6 +644,42 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   };
 
   // ═══════════════════════════════════════════════════════
+  //  ICRC-3: GET TRANSACTIONS (required by spec)
+  // ═══════════════════════════════════════════════════════
+
+  public query func icrc3_get_transactions(args : { start : Nat; length : Nat }) : async {
+    transactions : [T.Block];
+    log_length : Nat;
+    archived_transactions : [{
+      args : { start : Nat; length : Nat };
+      callback : shared query { start : Nat; length : Nat } -> async { transactions : [T.Block] };
+    }];
+  } {
+    let rawBlocks = BLog.getBlocks(blockState, args.start, args.length);
+    let blocks = Array.map<BLog.Block, T.Block>(rawBlocks, func(b) {
+      { id = b.index; block = blockToValue(b) }
+    });
+    {
+      transactions = blocks;
+      log_length = BLog.length(blockState);
+      archived_transactions = []; // single-canister: no archives
+    }
+  };
+
+  // ═══════════════════════════════════════════════════════
+  //  ICRC-10: SUPPORTED STANDARDS
+  // ═══════════════════════════════════════════════════════
+
+  public query func icrc10_supported_standards() : async [{ name : Text; url : Text }] {
+    [
+      { name = "ICRC-1"; url = "https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-1" },
+      { name = "ICRC-2"; url = "https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-2" },
+      { name = "ICRC-3"; url = "https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-3" },
+      { name = "ICRC-10"; url = "https://github.com/dfinity/ICRC/tree/main/ICRCs/ICRC-10" },
+    ]
+  };
+
+  // ═══════════════════════════════════════════════════════
   //  ICRC-3: ARCHIVES
   // ═══════════════════════════════════════════════════════
 
@@ -581,11 +688,9 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     start : Nat;
     end : Nat;
   }] {
-    [{
-      canister_id = Principal.fromActor(self);
-      start = 0;
-      end = BLog.length(blockState);
-    }]
+    // Single-canister ledger: no external archives. The ledger itself serves
+    // all blocks via icrc3_get_blocks. Per ICRC-3 spec, return empty array.
+    []
   };
 
   // ═══════════════════════════════════════════════════════

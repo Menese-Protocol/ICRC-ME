@@ -161,15 +161,8 @@ module {
   // ═══════════════════════════════════════════════════════
 
   func compareKeys(a : Blob, b : Blob) : Order.Order {
-    let aa = Blob.toArray(a);
-    let bb = Blob.toArray(b);
-    var i = 0;
-    while (i < aa.size() and i < bb.size()) {
-      if (Nat8.toNat(aa[i]) < Nat8.toNat(bb[i])) return #less;
-      if (Nat8.toNat(aa[i]) > Nat8.toNat(bb[i])) return #greater;
-      i += 1;
-    };
-    #equal
+    // Fixed-size keys (62 bytes) — use Blob.compare directly (avoids array allocation)
+    Blob.compare(a, b)
   };
 
   /// Binary search in a leaf node. Returns the index where key would be inserted.
@@ -385,16 +378,88 @@ module {
   /// Total number of entries
   public func size(state : State) : Nat { state.entryCount };
 
-  /// Iterate all entries in sorted order (for listSubaccounts)
+  /// Iterate all entries in sorted order (for listSubaccounts).
+  /// WARNING: materializes all entries — use prefixScan for targeted queries.
   public func entries(state : State) : [(Blob, Blob)] {
     let result = List.empty<(Blob, Blob)>();
     if (state.root != NULL_NODE) {
-      inorderCollect(state, state.root, result);
+      inorderCollect(state, state.root, result, 0xFFFF_FFFF);
     };
     List.toArray(result)
   };
 
-  func inorderCollect(state : State, node : Nat64, result : List.List<(Blob, Blob)>) {
+  /// Scan entries whose key starts with `prefix`. Returns up to `maxResults` entries.
+  /// O(k log n) where k = matching entries, instead of O(n) for full iteration.
+  public func prefixScan(state : State, prefix : Blob, maxResults : Nat) : [(Blob, Blob)] {
+    let result = List.empty<(Blob, Blob)>();
+    if (state.root != NULL_NODE) {
+      ignore prefixCollect(state, state.root, prefix, result, maxResults);
+    };
+    List.toArray(result)
+  };
+
+  /// Check if a key starts with the given prefix
+  func hasPrefix(key : Blob, prefix : Blob) : Bool {
+    if (prefix.size() > key.size()) return false;
+    let ka = Blob.toArray(key);
+    let pa = Blob.toArray(prefix);
+    var i = 0;
+    while (i < pa.size()) {
+      if (ka[i] != pa[i]) return false;
+      i += 1;
+    };
+    true
+  };
+
+  /// Check if any key with this prefix could exist at or after `key` in sort order
+  func prefixCouldFollow(key : Blob, prefix : Blob) : Bool {
+    // A key with `prefix` could follow `key` if prefix >= key[0..prefix.size()]
+    let ka = Blob.toArray(key);
+    let pa = Blob.toArray(prefix);
+    var i = 0;
+    while (i < pa.size() and i < ka.size()) {
+      if (Nat8.toNat(pa[i]) > Nat8.toNat(ka[i])) return true;
+      if (Nat8.toNat(pa[i]) < Nat8.toNat(ka[i])) return false;
+      i += 1;
+    };
+    true // prefix == key prefix, so matches could follow
+  };
+
+  /// Returns count of entries collected (for early termination)
+  func prefixCollect(state : State, node : Nat64, prefix : Blob, result : List.List<(Blob, Blob)>, maxResults : Nat) : Nat {
+    let count = nodeCount(state, node);
+    var collected : Nat = 0;
+    if (nodeType(state, node) == NODE_LEAF) {
+      var i = 0;
+      while (i < count and collected < maxResults) {
+        let key = leafKey(state, node, i);
+        if (hasPrefix(key, prefix)) {
+          List.add(result, (key, leafVal(state, node, i)));
+          collected += 1;
+        } else if (not prefixCouldFollow(key, prefix) and i > 0) {
+          // Past the prefix range, stop scanning this leaf
+          return collected;
+        };
+        i += 1;
+      };
+    } else {
+      var i = 0;
+      while (i <= count and collected < maxResults) {
+        // Check if this subtree could contain prefix matches
+        let shouldDescend = if (i < count) {
+          let sepKey = internalKey(state, node, i);
+          prefixCouldFollow(sepKey, prefix) or hasPrefix(sepKey, prefix)
+        } else { true }; // always check last child
+        if (shouldDescend) {
+          collected += prefixCollect(state, getChild(state, node, i), prefix, result, maxResults - collected);
+        };
+        i += 1;
+      };
+    };
+    collected
+  };
+
+  func inorderCollect(state : State, node : Nat64, result : List.List<(Blob, Blob)>, maxResults : Nat) {
     let count = nodeCount(state, node);
     if (nodeType(state, node) == NODE_LEAF) {
       var i = 0;
@@ -405,12 +470,7 @@ module {
     } else {
       var i = 0;
       while (i <= count) {
-        inorderCollect(state, getChild(state, node, i), result);
-        if (i < count) {
-          // Also need to find the entry in the subtree — internal keys are separators, not entries
-          // Actually in a B-tree, internal keys ARE copies of leaf keys. The entry lives in the leaf.
-          // So just traverse children; leaves have all entries.
-        };
+        inorderCollect(state, getChild(state, node, i), result, maxResults);
         i += 1;
       };
     };
