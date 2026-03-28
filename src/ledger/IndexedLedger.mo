@@ -29,7 +29,7 @@ import Array "mo:core/Array";
 import Sha256 "mo:sha2/Sha256";
 
 import T "Types";
-import Bal "Balances";
+import Bal "RegionBalances";
 import Allow "Allowances";
 import BLog "BlockLog";
 import Cert "CertifiedTree";
