@@ -86,6 +86,13 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   //  at ~10M cycles/call = (balance - threshold) / 10M calls to trigger.
   // ═══════════════════════════════════════════════════════
 
+  // Admin: defaults to deployer, transferable
+  var adminPrincipal : Principal = initMsg.caller;
+
+  func isAdmin(caller : Principal) : Bool {
+    Principal.equal(caller, adminPrincipal);
+  };
+
   // 100B cycles = ~30 days of idle burn. Configurable by admin.
   var circuitBreakerThreshold : Nat = 100_000_000_000;
   var circuitBreakerTripped : Bool = false;
@@ -482,7 +489,14 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     let isMint = isMintingAccount(from);
 
     if (isBurn) {
-      // Burn: fee must be 0 for burns
+      // BadBurn check: amount must be > 0 (same as icrc1_transfer burn path)
+      if (amount == 0) {
+        switch (savedAllowance) {
+          case (?saved) { ignore Allow.approve(allowState, from, spender, saved.allowance, saved.expires_at, null) };
+          case null {};
+        };
+        return #Err(#GenericError({ error_code = 3; message = "BadBurn: min_burn_amount is 1" }));
+      };
       switch (Bal.burn(balState, from, amount)) {
         case (#err(#InsufficientFunds({ balance }))) {
           switch (savedAllowance) {
@@ -500,7 +514,14 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     if (isMint) {
       switch (Bal.mint(balState, to, amount)) {
-        case (#err(_)) return #Err(#GenericError({ error_code = 1; message = "Mint exceeds supply" }));
+        case (#err(_)) {
+          // Restore allowance on mint failure (same pattern as burn + transfer paths)
+          switch (savedAllowance) {
+            case (?saved) { ignore Allow.approve(allowState, from, spender, saved.allowance, saved.expires_at, null) };
+            case null {};
+          };
+          return #Err(#GenericError({ error_code = 1; message = "Mint exceeds supply" }));
+        };
         case (#ok(())) {};
       };
       let tx = makeTx("mint", null, ?to, ?spender, amount, null, tfArgs.memo);
@@ -578,9 +599,18 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   };
 
   public shared ({ caller }) func setCircuitBreakerThreshold(newThreshold : Nat) : async () {
-    assert(caller == initMsg.caller); // admin only
+    assert(isAdmin(caller));
     circuitBreakerThreshold := newThreshold;
   };
+
+  /// Transfer admin to a new principal. Only current admin can call.
+  public shared ({ caller }) func transferAdmin(newAdmin : Principal) : async () {
+    assert(isAdmin(caller));
+    assert(not Principal.isAnonymous(newAdmin));
+    adminPrincipal := newAdmin;
+  };
+
+  public query func getAdmin() : async Principal { adminPrincipal };
 
   /// ICRC-3: Supported block types
   public query func icrc3_supported_block_types() : async [{ block_type : Text; url : Text }] {
@@ -699,28 +729,83 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   //  ICRC-3: GET TRANSACTIONS (required by spec)
   // ═══════════════════════════════════════════════════════
 
+  type ArchiveQueryInterface = actor {
+    icrc3_get_blocks_query : shared query [{ start : Nat; length : Nat }] -> async {
+      blocks : [T.Block];
+      log_length : Nat;
+    };
+  };
+
   public query func icrc3_get_transactions(args : { start : Nat; length : Nat }) : async {
     transactions : [T.Block];
     log_length : Nat;
     archived_transactions : [{
-      args : { start : Nat; length : Nat };
-      callback : shared query { start : Nat; length : Nat } -> async { transactions : [T.Block] };
+      args : [{ start : Nat; length : Nat }];
+      callback : shared query [{ start : Nat; length : Nat }] -> async {
+        blocks : [T.Block];
+        log_length : Nat;
+      };
     }];
   } {
-    // Only serve locally-held blocks; archived ranges are in archive canisters
+    let requestedEnd = args.start + args.length;
+    let totalLogLen = localBlockOffset + BLog.length(blockState);
+
+    // Build archive callbacks for any requested blocks that fall in archived ranges
+    type ArchiveCallback = {
+      args : [{ start : Nat; length : Nat }];
+      callback : shared query [{ start : Nat; length : Nat }] -> async {
+        blocks : [T.Block];
+        log_length : Nat;
+      };
+    };
+
+    // Count matching archives first, then build array
+    var matchCount : Nat = 0;
+    for (a in archives.vals()) {
+      if (args.start <= a.lastBlock and requestedEnd > a.firstBlock) {
+        matchCount += 1;
+      };
+    };
+
+    let archivedEntries = Array.tabulate<ArchiveCallback>(matchCount, func(idx : Nat) : ArchiveCallback {
+      // Find the idx-th matching archive
+      var matched : Nat = 0;
+      var result : ArchiveCallback = {
+        args = []; callback = (actor("aaaaa-aa") : ArchiveQueryInterface).icrc3_get_blocks_query;
+      };
+      label scan for (a in archives.vals()) {
+        if (args.start <= a.lastBlock and requestedEnd > a.firstBlock) {
+          if (matched == idx) {
+            let overlapStart = Nat.max(args.start, a.firstBlock);
+            let overlapEnd = Nat.min(requestedEnd, a.lastBlock + 1);
+            let archiveActor : ArchiveQueryInterface = actor (Principal.toText(a.canisterId));
+            result := {
+              args = [{ start = overlapStart; length = overlapEnd - overlapStart }];
+              callback = archiveActor.icrc3_get_blocks_query;
+            };
+            break scan;
+          };
+          matched += 1;
+        };
+      };
+      result;
+    });
+
+    // Serve locally-held blocks
     let effectiveStart = Nat.max(args.start, localBlockOffset);
-    let blocks = if (effectiveStart < BLog.length(blockState)) {
+    let blocks = if (effectiveStart < totalLogLen) {
       let localIdx = effectiveStart - localBlockOffset;
-      let effectiveLen = Nat.min(args.length, BLog.length(blockState) - effectiveStart);
+      let effectiveLen = Nat.min(args.length, totalLogLen - effectiveStart);
       let rawBlocks = BLog.getBlocks(blockState, localIdx, effectiveLen);
       Array.map<BLog.Block, T.Block>(rawBlocks, func(b) {
         { id = localBlockOffset + b.index; block = blockToValue(b) }
       })
     } else { [] };
+
     {
       transactions = blocks;
-      log_length = BLog.length(blockState);
-      archived_transactions = []; // archive callbacks require shared functions — clients use icrc3_get_archives to discover archive canisters
+      log_length = totalLogLen;
+      archived_transactions = archivedEntries;
     }
   };
 
@@ -819,7 +904,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   };
 
   public shared ({ caller }) func set_fee_collector(fc : ?T.Account) : async () {
-    assert(caller == initMsg.caller);
+    assert(isAdmin(caller));
     feeCollector := fc;
   };
 
@@ -830,7 +915,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   /// Set archive threshold (admin only). Blocks in the main canister's StableLog
   /// beyond this count trigger automatic archival.
   public shared ({ caller }) func setArchiveThreshold(threshold : Nat) : async () {
-    assert(caller == initMsg.caller);
+    assert(isAdmin(caller));
     archiveBlockThreshold := threshold;
   };
 
@@ -838,7 +923,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   /// Spawns a new Archive canister, migrates blocks [localBlockOffset..currentCount-retainCount],
   /// then updates the archive registry.
   public shared ({ caller }) func triggerArchive(retainCount : Nat, archiveCycles : Nat) : async { #ok : Principal; #err : Text } {
-    assert(caller == initMsg.caller);
+    assert(isAdmin(caller));
     if (archiveInProgress) return #err("Archive already in progress");
     let totalBlocks = BLog.length(blockState);
     if (totalBlocks <= retainCount) return #err("Nothing to archive");
