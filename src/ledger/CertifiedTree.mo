@@ -59,34 +59,35 @@ module {
     #pruned : Blob;
   };
 
-  /// Compute hash of a hash tree node (IC spec §3.2: domain separator strings)
-  /// See https://internetcomputer.org/docs/references/ic-interface-spec/#hash-tree
+  /// Compute hash of a hash tree node per IC Interface Spec §Certificate.
+  /// domain_sep(s) = SHA256(|s| as single byte ∥ s ∥ ...).
+  /// Reference: https://internetcomputer.org/docs/references/ic-interface-spec/#hash-tree
   public func hashTree(tree : HashTree) : Blob {
     switch (tree) {
       case (#empty) {
-        Sha256.fromBlob(#sha256, Text.encodeUtf8("ic-hashtree-empty"))
+        domainHash("ic-hashtree-empty", [])
       };
       case (#fork(left, right)) {
-        let lHash = hashTree(left);
-        let rHash = hashTree(right);
-        hashDomainConcat("ic-hashtree-fork", [lHash, rHash])
+        domainHash("ic-hashtree-fork", [hashTree(left), hashTree(right)])
       };
       case (#labeled(lbl, subtree)) {
-        let subHash = hashTree(subtree);
-        hashDomainConcat("ic-hashtree-labeled", [lbl, subHash])
+        domainHash("ic-hashtree-labeled", [lbl, hashTree(subtree)])
       };
       case (#leaf(data)) {
-        hashDomainConcat("ic-hashtree-leaf", [data])
+        domainHash("ic-hashtree-leaf", [data])
       };
       case (#pruned(hash)) {
-        hash // Already a hash
+        hash
       };
     };
   };
 
-  func hashDomainConcat(domain : Text, parts : [Blob]) : Blob {
+  /// IC domain separation: H( len_byte ∥ domain_string ∥ parts... )
+  func domainHash(domain : Text, parts : [Blob]) : Blob {
     let digest = Sha256.Digest(#sha256);
-    digest.writeBlob(Text.encodeUtf8(domain));
+    let domainBytes = Text.encodeUtf8(domain);
+    digest.writeArray([Nat8.fromNat(domainBytes.size())]); // length prefix byte
+    digest.writeBlob(domainBytes);
     for (p in parts.vals()) { digest.writeBlob(p) };
     digest.sum()
   };

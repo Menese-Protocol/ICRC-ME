@@ -57,11 +57,14 @@ module {
   //  HASH FUNCTIONS (FNV-1a with seed mixing)
   // ═══════════════════════════════════════════════════════
 
-  /// FNV-1a hash of a Nat64 value with a seed
-  func fnv1a(value : Nat64, seed : Nat32) : Nat32 {
+  /// Double-hashing scheme for k hash functions: h_i(x) = h1(x) + i * h2(x).
+  /// Uses two independent FNV-1a hashes with distinct offset bases.
+  /// This provides provably pairwise-independent hash functions (Kirsch & Mitzenmacher 2006).
+  let FNV_OFFSET_2 : Nat32 = 389564586; // secondary offset basis
+
+  func fnv1aBase(value : Nat64, offset : Nat32) : Nat32 {
     let v = Nat64.toNat(value);
-    var hash = FNV_OFFSET ^ seed;
-    // Process 8 bytes of the Nat64
+    var hash = offset;
     hash := (hash ^ Nat32.fromNat(v % 256)) *% FNV_PRIME;
     hash := (hash ^ Nat32.fromNat((v / 256) % 256)) *% FNV_PRIME;
     hash := (hash ^ Nat32.fromNat((v / 65536) % 256)) *% FNV_PRIME;
@@ -71,6 +74,13 @@ module {
     hash := (hash ^ Nat32.fromNat((v / 281474976710656) % 256)) *% FNV_PRIME;
     hash := (hash ^ Nat32.fromNat((v / 72057594037927936) % 256)) *% FNV_PRIME;
     hash
+  };
+
+  /// h_i(x) = h1(x) + i * h2(x) mod FILTER_BITS
+  func bloomHash(value : Nat64, i : Nat32) : Nat32 {
+    let h1 = fnv1aBase(value, FNV_OFFSET);
+    let h2 = fnv1aBase(value, FNV_OFFSET_2);
+    (h1 +% i *% h2) % FILTER_BITS
   };
 
   // ═══════════════════════════════════════════════════════
@@ -110,8 +120,7 @@ module {
     maybeRotate(state, now);
     var i : Nat32 = 0;
     while (i < NUM_HASHES) {
-      let h = fnv1a(timestamp, i) % FILTER_BITS;
-      setBit(state.current, h);
+      setBit(state.current, bloomHash(timestamp, i));
       i += 1;
     };
   };
@@ -125,8 +134,7 @@ module {
     var allSet = true;
     var i : Nat32 = 0;
     while (i < NUM_HASHES and allSet) {
-      let h = fnv1a(timestamp, i) % FILTER_BITS;
-      if (not testBit(state.current, h)) { allSet := false };
+      if (not testBit(state.current, bloomHash(timestamp, i))) { allSet := false };
       i += 1;
     };
     if (allSet) return true;
@@ -134,8 +142,7 @@ module {
     allSet := true;
     i := 0;
     while (i < NUM_HASHES and allSet) {
-      let h = fnv1a(timestamp, i) % FILTER_BITS;
-      if (not testBit(state.previous, h)) { allSet := false };
+      if (not testBit(state.previous, bloomHash(timestamp, i))) { allSet := false };
       i += 1;
     };
     allSet

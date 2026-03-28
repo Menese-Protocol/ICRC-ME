@@ -93,11 +93,15 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   let PERMITTED_DRIFT_NS : Nat64 = 60_000_000_000;
 
   /// Build a dedup key from (caller, timestamp, amount, memo).
-  /// SHA256 ensures fixed-size key for Map and Bloom filter.
+  /// Every variable-length field is length-prefixed to prevent cross-field ambiguity.
+  /// SHA256 output is the fixed-size key for Map and Bloom filter.
   func buildDedupKey(caller : Principal, ts : Nat64, amount : Nat, memo : ?Blob) : Blob {
     let digest = Sha256.Digest(#sha256);
-    digest.writeBlob(Principal.toBlob(caller));
-    // Timestamp as 8-byte big-endian
+    // Principal: length-prefixed (variable 0-29 bytes)
+    let pb = Principal.toBlob(caller);
+    digest.writeArray([Nat8.fromNat(pb.size())]);
+    digest.writeBlob(pb);
+    // Timestamp: fixed 8-byte big-endian (no length prefix needed)
     let tsN = Nat64.toNat(ts);
     digest.writeArray([
       Nat8.fromNat((tsN / 72057594037927936) % 256),
@@ -109,18 +113,24 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       Nat8.fromNat((tsN / 256) % 256),
       Nat8.fromNat(tsN % 256),
     ]);
-    // Amount as variable-length big-endian
-    if (amount == 0) { digest.writeArray([0]) } else {
+    // Amount: length-prefixed big-endian (prevents boundary confusion with memo tag)
+    if (amount == 0) { digest.writeArray([1, 0]) } else {
       var tmp = amount; var bc : Nat = 0;
       while (tmp > 0) { tmp /= 256; bc += 1 };
+      digest.writeArray([Nat8.fromNat(bc)]); // byte count prefix
       let bytes = Array.tabulate<Nat8>(bc, func(i) {
         Nat8.fromNat((amount / (256 ** (bc - 1 - i))) % 256)
       });
       digest.writeArray(bytes);
     };
-    // Memo (presence flag + content)
+    // Memo: presence flag + length-prefixed content
     switch (memo) {
-      case (?m) { digest.writeArray([0x01]); digest.writeBlob(m) };
+      case (?m) {
+        digest.writeArray([0x01]);
+        // Length as 2-byte big-endian (max memo = 256 bytes)
+        digest.writeArray([Nat8.fromNat(m.size() / 256), Nat8.fromNat(m.size() % 256)]);
+        digest.writeBlob(m);
+      };
       case null { digest.writeArray([0x00]) };
     };
     digest.sum()

@@ -80,7 +80,9 @@ module {
     ]);
   };
 
-  /// Compute SHA256 hash of block content using binary preimage (zero-copy)
+  /// Compute SHA256 hash of block content.
+  /// Preimage structure: domain_tag ∥ parent ∥ timestamp ∥ kind ∥ amount ∥ accounts ∥ fee
+  /// Every variable-length field is length-prefixed to prevent cross-field ambiguity.
   func computeBlockHash(
     parentHash : ?Blob,
     timestamp : Nat64,
@@ -88,7 +90,9 @@ module {
     effectiveFee : ?Nat,
   ) : Blob {
     let digest = Sha256.Digest(#sha256);
-    // Parent hash (32 bytes or absent — length-prefixed for domain separation)
+    // Global domain tag (prevents cross-protocol collisions)
+    digest.writeArray([0x49, 0x43, 0x52, 0x43]); // "ICRC"
+    // Parent hash (32 bytes or absent)
     switch (parentHash) {
       case (?h) { digest.writeArray([0x01]); digest.writeBlob(h) };
       case null { digest.writeArray([0x00]) };
@@ -99,15 +103,18 @@ module {
     let kindBytes = Text.encodeUtf8(tx.kind);
     natToBytes(digest, kindBytes.size());
     digest.writeBlob(kindBytes);
-    // Amount: variable-length big-endian
+    // Amount: length-prefixed big-endian
     natToBytes(digest, tx.amount);
-    // Accounts: principal + subaccount with presence flags
+    // Accounts: length-prefixed principal + presence-tagged subaccount
     func hashAccount(d : Sha256.Digest, acc : ?T.Account) {
       switch (acc) {
         case (?a) {
-          d.writeArray([0x01]); d.writeBlob(Principal.toBlob(a.owner));
+          d.writeArray([0x01]);
+          let pb = Principal.toBlob(a.owner);
+          d.writeArray([Nat8.fromNat(pb.size())]); // length prefix for principal
+          d.writeBlob(pb);
           switch (a.subaccount) {
-            case (?s) { d.writeArray([0x01]); d.writeBlob(s) };
+            case (?s) { d.writeArray([0x01]); d.writeBlob(s) }; // always 32 bytes
             case null { d.writeArray([0x00]) };
           };
         };
@@ -116,7 +123,7 @@ module {
     };
     hashAccount(digest, tx.from);
     hashAccount(digest, tx.to);
-    // Fee: presence flag + variable-length
+    // Fee: presence flag + length-prefixed value
     switch (effectiveFee) {
       case (?f) { digest.writeArray([0x01]); natToBytes(digest, f) };
       case null { digest.writeArray([0x00]) };
@@ -157,9 +164,10 @@ module {
     let hash = computeBlockHash(state.lastHash, timestamp, tx, effectiveFee);
     let encoded = encodeBlock(idx, state.lastHash, hash, timestamp, tx, effectiveFee);
     ignore SLog.append(state.stableLog, encoded);
-    // Use blockHash directly as MMR leaf (domain separation is in internal nodes)
-    // Saves one full SHA256 per block vs MMR.hashLeaf(hash)
-    ignore MMR.append(state.mmr, hash);
+    // Leaf domain separation: H(0x00 ∥ blockHash) distinguishes leaves from
+    // internal nodes H(0x01 ∥ left ∥ right). Required for Merkle security
+    // under collision resistance alone (without assuming preimage resistance).
+    ignore MMR.append(state.mmr, MMR.hashLeaf(hash));
     state.blockCount += 1;
     state.lastHash := ?hash;
     // Index accounts in Region (stable memory; invisible to GC)
