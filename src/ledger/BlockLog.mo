@@ -40,10 +40,11 @@ module {
     effectiveFee : ?Nat;
   };
 
-  /// Internal decoded block with parentHash from CBOR
+  /// Internal decoded block
   type DecodedBlock = {
     tx : T.Transaction;
     parentHash : ?Blob;
+    storedHash : ?Blob; // v3.1+: hash stored inline, avoids recomputation on read
   };
 
   // ═══════════════════════════════════════════════════════
@@ -183,8 +184,8 @@ module {
   //  CBOR is reconstructed lazily on get_blocks reads only.
   // ═══════════════════════════════════════════════════════
 
-  func encodeBlock(_idx : Nat, parentHash : ?Blob, _hash : Blob, ts : Nat64, tx : T.Transaction, fee : ?Nat) : Blob {
-    let buf = VarArray.repeat<Nat8>(0, 600);
+  func encodeBlock(_idx : Nat, parentHash : ?Blob, blockHash : Blob, ts : Nat64, tx : T.Transaction, fee : ?Nat) : Blob {
+    let buf = VarArray.repeat<Nat8>(0, 640); // +32 for stored hash
     var len : Nat = 0;
     func w(b : Nat8) { buf[len] := b; len += 1 };
     func wBlob(b : Blob) { for (byte in b.vals()) { w(byte) } };
@@ -245,6 +246,8 @@ module {
     };
     // Parent hash
     switch (parentHash) { case (?h) wBlob(h); case null {} };
+    // Block hash (32 bytes, always present — enables O(1) read without recomputation)
+    wBlob(blockHash);
     Blob.fromArray(Array.tabulate<Nat8>(len, func(i) { buf[i] }))
   };
 
@@ -268,6 +271,7 @@ module {
               timestamp = btx.timestamp; index = btx.index;
             };
             parentHash = btx.parentHash;
+            storedHash = null;
           }
         };
         case null null;
@@ -275,7 +279,7 @@ module {
     } else {
       // v1 fallback: pipe-delimited text (backward compatible)
       switch (decodeBlockV1(idx, data)) {
-        case (?tx) ?{ tx; parentHash = null };
+        case (?tx) ?{ tx; parentHash = null; storedHash = null };
         case null null;
       };
     };
@@ -334,9 +338,15 @@ module {
       let h = Blob.fromArray(Array.tabulate<Nat8>(32, func(j) { bytes[p + j] }));
       p += 32; ?h
     } else null;
+    // Stored block hash (32 bytes, appended after parent hash in v3.1+)
+    let storedHash = if (p + 32 <= bytes.size()) {
+      let h = Blob.fromArray(Array.tabulate<Nat8>(32, func(j) { bytes[p + j] }));
+      p += 32; ?h
+    } else null; // older v3 blocks without stored hash
     ?{
       tx = { kind; from; to; spender; amount; fee; memo; timestamp = Nat64.fromNat(ts); index = idx };
       parentHash;
+      storedHash;
     }
   };
 
@@ -424,13 +434,11 @@ module {
         case (?data) {
           switch (decodeBlock(i, data)) {
             case (?decoded) {
-              // Recompute hash using same structured preimage as append()
-              let hash = computeBlockHash(
-                decoded.parentHash,
-                decoded.tx.timestamp,
-                decoded.tx,
-                decoded.tx.fee,
-              );
+              // Use stored hash (O(1)) or recompute for legacy blocks without one
+              let hash = switch (decoded.storedHash) {
+                case (?h) h;
+                case null computeBlockHash(decoded.parentHash, decoded.tx.timestamp, decoded.tx, decoded.tx.fee);
+              };
               List.add(result, {
                 index = i;
                 parentHash = decoded.parentHash;
@@ -448,6 +456,19 @@ module {
       i += 1;
     };
     List.toArray(result)
+  };
+
+  /// Get raw encoded block blobs for archive migration.
+  /// Reads directly from StableLog without decoding.
+  public func getRawBlobs(state : State, localStart : Nat, count : Nat) : [Blob] {
+    let end = Nat.min(localStart + count, state.blockCount);
+    if (localStart >= state.blockCount) return [];
+    Array.tabulate<Blob>(end - localStart, func(i) {
+      switch (SLog.get(state.stableLog, localStart + i)) {
+        case (?b) b;
+        case null "" : Blob;
+      };
+    })
   };
 
   public func length(state : State) : Nat { state.blockCount };

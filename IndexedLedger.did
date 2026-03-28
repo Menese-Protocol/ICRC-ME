@@ -86,6 +86,15 @@ type InitArgs =
  };
 type IndexedLedger = 
  service {
+   /// Query archive status
+   getArchiveStatus: () ->
+    (record {
+       archiveCount: nat;
+       archiveThreshold: nat;
+       localBlockCount: nat;
+       localBlockOffset: nat;
+       totalBlocks: nat;
+     }) query;
    getShieldStatus: () ->
     (record {
        blockCount: nat;
@@ -185,6 +194,9 @@ type IndexedLedger =
          }) query;
    /// Get the MMR root hash (commitment over all blocks)
    mmr_root: () -> (opt blob) query;
+   /// Set archive threshold (admin only). Blocks in the main canister's StableLog
+   /// beyond this count trigger automatic archival.
+   setArchiveThreshold: (threshold: nat) -> ();
    setCircuitBreakerThreshold: (newThreshold: nat) -> ();
    set_fee_collector: (fc: opt Account) -> ();
    status: () ->
@@ -196,6 +208,14 @@ type IndexedLedger =
        total_supply: nat;
        total_transactions: nat;
      }) query;
+   /// Manually trigger archive spawning (admin only).
+   /// Spawns a new Archive canister, migrates blocks [localBlockOffset..currentCount-retainCount],
+   /// then updates the archive registry.
+   triggerArchive: (retainCount: nat, archiveCycles: nat) ->
+    (variant {
+       err: text;
+       ok: principal;
+     });
  };
 type GetBlocksArgs = 
  record {

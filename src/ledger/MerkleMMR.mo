@@ -1,19 +1,21 @@
 /// MerkleMMR.mo — Merkle Mountain Range for O(log n) inclusion proofs
 ///
-/// A Merkle Mountain Range (MMR) is an append-only accumulator that provides:
-///   - O(1) append (amortized)
-///   - O(log n) proof of inclusion for any leaf
-///   - O(log n) root hash computation
+/// Leaf hashes and internal node hashes are stored in Region stable memory.
+/// Proof generation reads O(log n) hashes from Region — no recomputation.
 ///
-/// Leaf hashes are stored in Region stable memory (32 bytes each, O(1) random
-/// access by index). This eliminates the heap List that would OOM at scale.
-/// At 10M blocks = 320MB of Region memory (cheap); vs 320MB of heap (fatal).
+/// Storage layout in Region:
+///   Positions 0..N-1 map to MMR node positions (not leaf indices).
+///   MMR position numbering follows the standard post-order scheme:
+///     Leaf 0 → pos 0, Leaf 1 → pos 1, Internal → pos 2,
+///     Leaf 2 → pos 3, etc.
+///   Each position stores a 32-byte SHA-256 hash.
+///
+/// This gives O(1) append, O(log n) proof, O(log n) root computation.
 
 import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Blob "mo:core/Blob";
-import Array "mo:core/Array";
 import VarArray "mo:core/VarArray";
 import List "mo:core/List";
 import Region "mo:core/Region";
@@ -27,16 +29,18 @@ module {
   let MAX_HEIGHT : Nat = 64;
 
   public type State = {
-    var peaks : [var ?Blob];  // peaks[height] = hash or null
+    var peaks : [var ?Blob];
     var leafCount : Nat;
-    hashRegion : Region.Region; // leaf hashes stored here, 32 bytes each
-    var hashRegionSize : Nat64; // bytes written
+    var nodeCount : Nat;       // total MMR nodes (leaves + internals)
+    hashRegion : Region.Region;
+    var hashRegionSize : Nat64;
   };
 
   public func newState() : State {
     {
       var peaks = VarArray.repeat<?Blob>(null, MAX_HEIGHT);
       var leafCount = 0;
+      var nodeCount = 0;
       hashRegion = Region.new();
       var hashRegionSize : Nat64 = 0;
     };
@@ -50,22 +54,20 @@ module {
     };
   };
 
-  /// Store a leaf hash in Region memory at index position
-  func storeLeafHash(state : State, index : Nat, hash : Blob) {
-    let off = Nat64.fromNat(index) * HASH_SIZE;
+  func storeHash(state : State, pos : Nat, hash : Blob) {
+    let off = Nat64.fromNat(pos) * HASH_SIZE;
     let needed = off + HASH_SIZE;
     growIfNeeded(state.hashRegion, needed);
     Region.storeBlob(state.hashRegion, off, hash);
     if (needed > state.hashRegionSize) { state.hashRegionSize := needed };
   };
 
-  /// Load a leaf hash from Region memory by index
-  func loadLeafHash(state : State, index : Nat) : Blob {
-    Region.loadBlob(state.hashRegion, Nat64.fromNat(index) * HASH_SIZE, 32)
+  func loadHash(state : State, pos : Nat) : Blob {
+    Region.loadBlob(state.hashRegion, Nat64.fromNat(pos) * HASH_SIZE, 32)
   };
 
   // ═══════════════════════════════════════════════════════
-  //  CORE OPERATIONS
+  //  HASH PRIMITIVES
   // ═══════════════════════════════════════════════════════
 
   func hashNode(left : Blob, right : Blob) : Blob {
@@ -83,28 +85,49 @@ module {
     digest.sum()
   };
 
-  /// Append a leaf hash. O(log n) amortized.
+  // ═══════════════════════════════════════════════════════
+  //  MMR POSITION ARITHMETIC
+  //
+  //  Standard MMR uses post-order positions:
+  //    Height 0 (leaves): positions where all bits below height are 0
+  //    The position of leaf i: i * 2 + popcount of merged trees
+  //
+  //  Simpler approach: store nodes sequentially as they're created.
+  //  Leaf positions and internal positions interleave naturally.
+  //  Track with a running counter (nodeCount).
+  // ═══════════════════════════════════════════════════════
+
+  /// Append a leaf hash. Stores leaf + all internal nodes created by merging.
+  /// O(log n) amortized. Returns the leaf index (0-based).
   public func append(state : State, leafHash : Blob) : Nat {
-    let idx = state.leafCount;
-    storeLeafHash(state, idx, leafHash);
+    let leafIdx = state.leafCount;
+    // Store leaf node
+    let leafPos = state.nodeCount;
+    storeHash(state, leafPos, leafHash);
+    state.nodeCount += 1;
+
     var current = leafHash;
     var height : Nat = 0;
     while (height < MAX_HEIGHT) {
       switch (state.peaks[height]) {
         case (?existing) {
+          // Merge: create internal node
           current := hashNode(existing, current);
+          let internalPos = state.nodeCount;
+          storeHash(state, internalPos, current);
+          state.nodeCount += 1;
           state.peaks[height] := null;
           height += 1;
         };
         case null {
           state.peaks[height] := ?current;
           state.leafCount += 1;
-          return idx;
+          return leafIdx;
         };
       };
     };
     state.leafCount += 1;
-    idx
+    leafIdx
   };
 
   /// Root hash from peaks. O(log n).
@@ -135,13 +158,13 @@ module {
     count
   };
 
-  /// Generate inclusion proof. Rebuilds only the relevant subtree from Region,
-  /// NOT the entire leaf set. O(2^h) where h = height of the containing peak tree.
-  /// For a balanced 1M-leaf MMR, h ~ 20 so this reads ~1M hashes from Region
-  /// in the worst case. For most proofs the containing tree is much smaller.
+  /// Generate inclusion proof for a leaf. O(log n) Region reads.
   ///
-  /// Optimization: walks the tree top-down, only loading the sibling path.
-  /// This is O(h) Region reads = O(log n). No heap materialization.
+  /// Strategy: Given leafIndex, we know the leaf's position in the MMR.
+  /// The MMR node positions follow a predictable pattern based on the
+  /// binary representation of the leaf count at insertion time.
+  /// For each level of the proof, we compute the sibling's position
+  /// and read its stored hash directly. No subtree recomputation needed.
   public func generateProof(
     state : State,
     leafIndex : Nat,
@@ -153,19 +176,23 @@ module {
     var treeHeight : Nat = 0;
     var found = false;
     var peakHeightIdx : Nat = 0;
+    // Also track the MMR node position where this tree starts
+    var treeNodeStart : Nat = 0;
 
     var h : Nat = MAX_HEIGHT;
     while (h > 0 and not found) {
       h -= 1;
       switch (state.peaks[h]) {
         case (?_) {
-          let treeSize = 2 ** h;
+          let treeSize = 2 ** h; // number of leaves in this tree
           if (leafIndex < treeStart + treeSize) {
             treeHeight := h;
             peakHeightIdx := h;
             found := true;
           } else {
             treeStart += treeSize;
+            // A perfect binary tree with 2^h leaves has 2^(h+1)-1 nodes
+            treeNodeStart += 2 ** (h + 1) - 1;
           };
         };
         case null {};
@@ -174,25 +201,38 @@ module {
 
     if (not found) return null;
 
-    // Build Merkle proof by walking the binary tree top-down.
-    // At each level, compute the sibling hash by reconstructing that subtree.
-    // Total Region reads: O(treeSize) in worst case, but we use a smarter approach:
-    // Walk bottom-up from the leaf, computing sibling hashes on demand.
+    // Compute proof path using MMR node positions.
+    // In a perfect binary tree stored in level-order within our sequential layout:
+    //   - Leaves are at positions treeNodeStart + 0, +2, +4, ... (stride 2)
+    //   - But we stored in creation order (post-order), not level-order.
+    //
+    // Simpler approach: rebuild the sibling path using the stored hashes.
+    // At each level, compute the sibling subtree hash from stored nodes.
+    // For a perfect binary tree, the sibling at level k needs 2^k leaf hashes
+    // and we can read the stored internal node hash directly if we track positions.
+    //
+    // Most efficient: compute positions of all siblings using the binary structure.
+    // The MMR node for a subtree root at height h containing 2^h leaves
+    // is at a position we can calculate from (treeNodeStart, localIndex, height).
     let siblings = List.empty<Blob>();
     let localIndex = leafIndex - treeStart;
-    var idx = localIndex;
-    var levelStart = treeStart;
-    ignore treeStart; // used above for localIndex calculation
 
-    // At each level, we need the sibling's hash. Compute it by rebuilding that subtree.
+    // Walk the tree bottom-up. At each level, find sibling hash.
+    // Use recursive subtree hash computation — but only read the ROOT of the sibling,
+    // which is already stored in Region (stored during append).
+    // The root of a subtree = the last node stored in that subtree's range.
+    var idx = localIndex;
     var currentHeight : Nat = 0;
     while (currentHeight < treeHeight) {
-      let subtreeSize = 2 ** currentHeight; // size of each node at this level
+      let subtreeLeaves = 2 ** currentHeight;
       let sibIdx = if (idx % 2 == 0) idx + 1 else idx - 1;
-      let sibStart = levelStart + sibIdx * subtreeSize;
-      // Compute hash of sibling subtree
-      let sibHash = computeSubtreeHash(state, sibStart, currentHeight);
-      List.add(siblings, sibHash);
+      // Compute the node position of the sibling subtree's root.
+      // In our sequential storage, a subtree of height h starting at leaf offset L
+      // within the tree has its root at:
+      //   treeNodeStart + subtreeRootPos(L, h, treeHeight)
+      let sibLeafStart = sibIdx * subtreeLeaves;
+      let sibRootPos = subtreeRootPosition(treeNodeStart, sibLeafStart, currentHeight, treeHeight);
+      List.add(siblings, loadHash(state, sibRootPos));
       idx /= 2;
       currentHeight += 1;
     };
@@ -221,18 +261,44 @@ module {
     }
   };
 
-  /// Compute hash of a perfect binary subtree rooted at `start` with given `height`.
-  /// Height 0 = single leaf. Height 1 = two leaves hashed. etc.
-  /// O(2^height) Region reads. For proof generation, each sibling subtree
-  /// is at most half the tree, and we only need log(n) of them.
-  func computeSubtreeHash(state : State, start : Nat, height : Nat) : Blob {
-    if (height == 0) {
-      return loadLeafHash(state, start);
+  /// Compute the node position of a subtree root within the sequential MMR layout.
+  /// A perfect binary tree of height H stored in post-order has 2^(H+1)-1 nodes.
+  /// The root is the LAST node. For a subtree at height h starting at leaf offset
+  /// leafStart within a tree of height treeHeight:
+  ///   - The subtree spans nodes [start..start + 2^(h+1) - 2]
+  ///   - The root is at start + 2^(h+1) - 2
+  func subtreeRootPosition(treeNodeStart : Nat, leafStart : Nat, subtreeHeight : Nat, treeHeight : Nat) : Nat {
+    // In our post-order layout, leaf i of the tree is at position:
+    //   treeNodeStart + nodePositionInTree(i, treeHeight)
+    // A subtree rooted at height h covering leaves [L..L+2^h-1] has its root
+    // at the position of the last node in that subtree.
+    //
+    // For a post-order traversal of a perfect binary tree:
+    //   nodePosition(leafStart, height) gives us the start of the subtree
+    //   The root of height-h subtree starting at leaf L is at:
+    //   sum of nodes in all complete subtrees before L, plus 2^(h+1)-2
+    var pos = treeNodeStart;
+    // Walk the path from root to the subtree, accumulating node offsets
+    var currentLeafStart : Nat = 0;
+    var currentHeight = treeHeight;
+    var targetLeafStart = leafStart;
+
+    while (currentHeight > subtreeHeight) {
+      let halfLeaves = 2 ** (currentHeight - 1);
+      let leftSubtreeNodes = 2 ** currentHeight - 1; // nodes in left child
+      if (targetLeafStart < currentLeafStart + halfLeaves) {
+        // Go left — skip nothing, left subtree starts at pos
+        currentHeight -= 1;
+      } else {
+        // Go right — skip left subtree + left subtree's nodes
+        pos += leftSubtreeNodes;
+        currentLeafStart += halfLeaves;
+        currentHeight -= 1;
+      };
     };
-    let halfSize = 2 ** (height - 1);
-    let left = computeSubtreeHash(state, start, height - 1);
-    let right = computeSubtreeHash(state, start + halfSize, height - 1);
-    hashNode(left, right)
+    // Now at the subtree root level. The root of a post-order subtree
+    // of height h is the LAST node: pos + 2^(h+1) - 2
+    pos + 2 ** (subtreeHeight + 1) - 2
   };
 
   /// Verify an inclusion proof.

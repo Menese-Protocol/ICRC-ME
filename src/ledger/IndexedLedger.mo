@@ -34,6 +34,7 @@ import Allow "Allowances";
 import BLog "BlockLog";
 import Cert "CertifiedTree";
 import Bloom "BloomFilter";
+import Archive "Archive";
 
 shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
@@ -57,6 +58,21 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
   // Fee collector (optional — fees go to pool if null)
   var feeCollector : ?T.Account = null;
+
+  // ═══════════════════════════════════════════════════════
+  //  ARCHIVE REGISTRY — Offload old blocks to child canisters
+  //
+  //  When the main StableLog exceeds archiveBlockThreshold blocks,
+  //  a new Archive canister is spawned and old blocks are migrated.
+  //  icrc3_get_archives returns the registry for client discovery.
+  // ═══════════════════════════════════════════════════════
+
+  type ArchiveEntry = { canisterId : Principal; firstBlock : Nat; lastBlock : Nat };
+  var archives : [ArchiveEntry] = [];
+  var archiveBlockThreshold : Nat = 2_000_000;  // trigger at 2M blocks (~500MB)
+  var archiveBatchSize : Nat = 500;             // blocks per inter-canister call
+  var archiveInProgress : Bool = false;
+  var localBlockOffset : Nat = 0;               // first block index still in local StableLog
 
   // ═══════════════════════════════════════════════════════
   //  CIRCUIT BREAKER — Cycle Drain Protection
@@ -706,9 +722,25 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     start : Nat;
     end : Nat;
   }] {
-    // Single-canister ledger: no external archives. The ledger itself serves
-    // all blocks via icrc3_get_blocks. Per ICRC-3 spec, return empty array.
-    []
+    // Return all archive canisters, optionally filtered by `from` principal
+    let startFrom : Nat = switch (args.from) {
+      case null 0;
+      case (?p) {
+        var skip : Nat = 0;
+        label find for (a in archives.vals()) {
+          if (Principal.equal(a.canisterId, p)) break find;
+          skip += 1;
+        };
+        skip
+      };
+    };
+    Array.tabulate<{ canister_id : Principal; start : Nat; end : Nat }>(
+      if (startFrom >= archives.size()) 0 else archives.size() - startFrom,
+      func(i) {
+        let a = archives[startFrom + i];
+        { canister_id = a.canisterId; start = a.firstBlock; end = a.lastBlock }
+      }
+    )
   };
 
   // ═══════════════════════════════════════════════════════
@@ -765,6 +797,75 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   public shared ({ caller }) func set_fee_collector(fc : ?T.Account) : async () {
     if (not Principal.equal(caller, initMsg.caller)) Runtime.trap("Not owner");
     feeCollector := fc;
+  };
+
+  // ═══════════════════════════════════════════════════════
+  //  ARCHIVE MANAGEMENT
+  // ═══════════════════════════════════════════════════════
+
+  /// Set archive threshold (admin only). Blocks in the main canister's StableLog
+  /// beyond this count trigger automatic archival.
+  public shared ({ caller }) func setArchiveThreshold(threshold : Nat) : async () {
+    assert(caller == initMsg.caller);
+    archiveBlockThreshold := threshold;
+  };
+
+  /// Manually trigger archive spawning (admin only).
+  /// Spawns a new Archive canister, migrates blocks [localBlockOffset..currentCount-retainCount],
+  /// then updates the archive registry.
+  public shared ({ caller }) func triggerArchive(retainCount : Nat, archiveCycles : Nat) : async { #ok : Principal; #err : Text } {
+    assert(caller == initMsg.caller);
+    if (archiveInProgress) return #err("Archive already in progress");
+    let totalBlocks = BLog.length(blockState);
+    if (totalBlocks <= retainCount) return #err("Nothing to archive");
+
+    archiveInProgress := true;
+
+    // Spawn new Archive canister
+    let archive = await (with cycles = archiveCycles) Archive.Archive(Principal.fromActor(self));
+    let archiveId = Principal.fromActor(archive);
+
+    let migrateStart = localBlockOffset;
+    let migrateEnd = totalBlocks - retainCount;
+
+    await archive.init(migrateStart);
+
+    // Migrate blocks in batches
+    var pos = migrateStart;
+    while (pos < migrateEnd) {
+      let batchEnd = Nat.min(pos + archiveBatchSize, migrateEnd);
+      let batch = BLog.getRawBlobs(blockState, pos - localBlockOffset, batchEnd - pos);
+      ignore await archive.appendBlocks(batch);
+      pos := batchEnd;
+    };
+
+    // Update registry
+    let entry : ArchiveEntry = { canisterId = archiveId; firstBlock = migrateStart; lastBlock = migrateEnd - 1 };
+    let newArchives = Array.tabulate<ArchiveEntry>(archives.size() + 1, func(i) {
+      if (i < archives.size()) archives[i] else entry
+    });
+    archives := newArchives;
+    localBlockOffset := migrateEnd;
+    archiveInProgress := false;
+
+    #ok(archiveId)
+  };
+
+  /// Query archive status
+  public query func getArchiveStatus() : async {
+    archiveCount : Nat;
+    localBlockOffset : Nat;
+    localBlockCount : Nat;
+    totalBlocks : Nat;
+    archiveThreshold : Nat;
+  } {
+    {
+      archiveCount = archives.size();
+      localBlockOffset;
+      localBlockCount = BLog.length(blockState) - localBlockOffset;
+      totalBlocks = BLog.length(blockState);
+      archiveThreshold = archiveBlockThreshold;
+    }
   };
 
   // Init at end to avoid forward references.
