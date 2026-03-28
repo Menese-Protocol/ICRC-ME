@@ -13,7 +13,6 @@
 /// This gives O(1) append, O(log n) proof, O(log n) root computation.
 
 import Nat "mo:core/Nat";
-import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Blob "mo:core/Blob";
 import VarArray "mo:core/VarArray";

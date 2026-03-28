@@ -31,10 +31,8 @@ import Array "mo:core/Array";
 import List "mo:core/List";
 import Region "mo:core/Region";
 import Runtime "mo:core/Runtime";
-import Principal "mo:core/Principal";
 import Order "mo:core/Order";
 
-import T "Types";
 
 module {
 

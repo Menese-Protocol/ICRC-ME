@@ -14,8 +14,6 @@ import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
 import Int "mo:core/Int";
 import Time "mo:core/Time";
-import Principal "mo:core/Principal";
-import Array "mo:core/Array";
 import List "mo:core/List";
 import Result "mo:core/Result";
 

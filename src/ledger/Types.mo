@@ -5,7 +5,6 @@
 
 import Principal "mo:core/Principal";
 import Nat8 "mo:core/Nat8";
-import Nat32 "mo:core/Nat32";
 import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 

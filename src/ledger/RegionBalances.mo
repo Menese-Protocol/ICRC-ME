@@ -12,7 +12,6 @@ import Nat8 "mo:core/Nat8";
 import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 import Result "mo:core/Result";
-import Runtime "mo:core/Runtime";
 
 import T "Types";
 import BTree "RegionBTree";
@@ -124,7 +123,7 @@ module {
 
   public func mint(state : State, to : T.Account, amount : Nat) : Result.Result<(), BalanceError> {
     if (amount > state.tokenPool) {
-      Runtime.trap("Mint exceeds total token supply");
+      return #err(#InsufficientFunds({ balance = state.tokenPool }));
     };
     state.tokenPool -= amount;
     credit(state, to, amount);

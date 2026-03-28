@@ -15,12 +15,10 @@ import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Int "mo:core/Int";
-import Text "mo:core/Text";
 import Blob "mo:core/Blob";
 import List "mo:core/List";
 import Map "mo:core/Map";
 import Time "mo:core/Time";
-import Runtime "mo:core/Runtime";
 import Timer "mo:core/Timer";
 import Cycles "mo:core/Cycles";
 
@@ -820,7 +818,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   };
 
   public shared ({ caller }) func set_fee_collector(fc : ?T.Account) : async () {
-    if (not Principal.equal(caller, initMsg.caller)) Runtime.trap("Not owner");
+    assert(caller == initMsg.caller);
     feeCollector := fc;
   };
 
@@ -914,7 +912,8 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     // Auto-archive: trigger when block count exceeds threshold
     if (archiveNeeded and not archiveInProgress) {
       archiveNeeded := false;
-      ignore await triggerArchive(archiveBlockThreshold / 2, 1_000_000_000_000);
+      try { ignore await triggerArchive(archiveBlockThreshold / 2, 1_000_000_000_000) }
+      catch (_) { archiveInProgress := false }; // prevent permanent deadlock on failure
     };
   });
 };

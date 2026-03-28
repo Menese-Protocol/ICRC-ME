@@ -141,7 +141,7 @@ module {
     var lastHash : ?Blob;
     stableLog : SLog.State;
     mmr : MMR.State;
-    compactIndex : CIdx.State;
+    btreeIndex : CIdx.State;
   };
 
   public func newState() : State {
@@ -150,7 +150,7 @@ module {
       var lastHash : ?Blob = null;
       stableLog = SLog.newState();
       mmr = MMR.newState();
-      compactIndex = CIdx.newState();
+      btreeIndex = CIdx.newState();
     };
   };
 
@@ -172,9 +172,9 @@ module {
     state.blockCount += 1;
     state.lastHash := ?hash;
     // Index accounts in Region (stable memory; invisible to GC)
-    CIdx.addIndex(state.compactIndex, tx.from, idx);
-    CIdx.addIndex(state.compactIndex, tx.to, idx);
-    CIdx.addIndex(state.compactIndex, tx.spender, idx);
+    CIdx.addIndex(state.btreeIndex, tx.from, idx);
+    CIdx.addIndex(state.btreeIndex, tx.to, idx);
+    CIdx.addIndex(state.btreeIndex, tx.spender, idx);
     idx
   };
 
@@ -393,7 +393,7 @@ module {
   // ═══════════════════════════════════════════════════════
 
   public func getAccountTransactions(state : State, account : T.Account, start : ?Nat, maxResults : Nat) : [T.Transaction] {
-    let indices = CIdx.getIndices(state.compactIndex, account, Nat.min(maxResults, 100));
+    let indices = CIdx.getIndices(state.btreeIndex, account, Nat.min(maxResults, 100));
     // indices are newest-first from RegionIndex; apply start filter
     let result = List.empty<T.Transaction>();
     label scan for (txIdx in indices.vals()) {
@@ -412,12 +412,24 @@ module {
   };
 
   public func getOldestTxId(state : State, account : T.Account) : ?Nat {
-    CIdx.getOldestIndex(state.compactIndex, account)
+    CIdx.getOldestIndex(state.btreeIndex, account)
   };
 
   public func listSubaccounts(state : State, owner : Principal, start : ?Blob) : [Blob] {
-    ignore start;
-    CIdx.listSubaccounts(state.compactIndex, owner, 1000)
+    let all = CIdx.listSubaccounts(state.btreeIndex, owner, 1000);
+    switch (start) {
+      case null all;
+      case (?s) {
+        // Skip subaccounts until we pass `start`, then return the rest
+        var found = false;
+        let filtered = List.empty<Blob>();
+        for (sub in all.vals()) {
+          if (found) { List.add(filtered, sub) }
+          else if (sub == s) { found := true };
+        };
+        List.toArray(filtered)
+      };
+    };
   };
 
   // ═══════════════════════════════════════════════════════
@@ -497,11 +509,11 @@ module {
 
   /// Query the Region-backed index for an account's tx indices
   public func regionGetIndices(state : State, account : T.Account, maxResults : Nat) : [Nat] {
-    CIdx.getIndices(state.compactIndex, account, maxResults)
+    CIdx.getIndices(state.btreeIndex, account, maxResults)
   };
 
   /// Number of accounts in the Region index
   public func regionAccountCount(state : State) : Nat {
-    CIdx.accountCount(state.compactIndex)
+    CIdx.accountCount(state.btreeIndex)
   };
 };

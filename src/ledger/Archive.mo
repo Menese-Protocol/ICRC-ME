@@ -17,7 +17,6 @@ import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
 import Blob "mo:core/Blob";
 import Array "mo:core/Array";
-import Text "mo:core/Text";
 import Runtime "mo:core/Runtime";
 
 import SLog "StableLog";
