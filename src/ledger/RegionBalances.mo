@@ -59,7 +59,7 @@ module {
   public func getBalance(state : State, account : T.Account) : Nat {
     let kb = T.accountKeyToBlob(T.accountKey(account));
     switch (BTree.get(state.btree, kb)) {
-      case (?val) decodeNat(val);
+      case (?val) { let n = decodeNat(val); if (n == 0) 0 else n }; // zero-entries treated as absent
       case null 0;
     };
   };

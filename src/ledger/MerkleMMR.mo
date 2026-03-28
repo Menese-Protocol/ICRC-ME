@@ -32,6 +32,7 @@ module {
     var peaks : [var ?Blob];
     var leafCount : Nat;
     var nodeCount : Nat;       // total MMR nodes (leaves + internals)
+    var baggedRoot : ?Blob;    // pre-computed root hash — O(1) access
     hashRegion : Region.Region;
     var hashRegionSize : Nat64;
   };
@@ -41,6 +42,7 @@ module {
       var peaks = VarArray.repeat<?Blob>(null, MAX_HEIGHT);
       var leafCount = 0;
       var nodeCount = 0;
+      var baggedRoot : ?Blob = null;
       hashRegion = Region.new();
       var hashRegionSize : Nat64 = 0;
     };
@@ -122,17 +124,18 @@ module {
         case null {
           state.peaks[height] := ?current;
           state.leafCount += 1;
+          recomputeBaggedRoot(state);
           return leafIdx;
         };
       };
     };
     state.leafCount += 1;
+    recomputeBaggedRoot(state);
     leafIdx
   };
 
-  /// Root hash from peaks. O(log n).
-  public func rootHash(state : State) : ?Blob {
-    if (state.leafCount == 0) return null;
+  /// Recompute bagged root from peaks. Called once per append.
+  func recomputeBaggedRoot(state : State) {
     var result : ?Blob = null;
     var h : Nat = MAX_HEIGHT;
     while (h > 0) {
@@ -147,8 +150,11 @@ module {
         case null {};
       };
     };
-    result
+    state.baggedRoot := result;
   };
+
+  /// Root hash — O(1) via pre-computed bagged root.
+  public func rootHash(state : State) : ?Blob { state.baggedRoot };
 
   public func peakCount(state : State) : Nat {
     var count : Nat = 0;

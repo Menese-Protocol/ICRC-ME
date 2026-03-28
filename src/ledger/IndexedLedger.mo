@@ -72,6 +72,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   var archiveBlockThreshold : Nat = 2_000_000;  // trigger at 2M blocks (~500MB)
   var archiveBatchSize : Nat = 500;             // blocks per inter-canister call
   var archiveInProgress : Bool = false;
+  var archiveNeeded : Bool = false;              // set by appendAndCertify, consumed by timer
   var localBlockOffset : Nat = 0;               // first block index still in local StableLog
 
   // ═══════════════════════════════════════════════════════
@@ -266,12 +267,18 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     { kind; from; to; spender; amount; fee; memo; timestamp = now(); index = BLog.length(blockState) }
   };
 
-  /// Append block + update certified data atomically
+  /// Append block + update certified data atomically.
+  /// Checks archive threshold and schedules auto-archive if exceeded.
   func appendAndCertify(tx : T.Transaction, effectiveFee : ?Nat) : Nat {
     let idx = BLog.append(blockState, tx, effectiveFee);
     switch (BLog.tipHash(blockState)) {
       case (?hash) Cert.updateTip(certState, idx, hash);
       case null {};
+    };
+    // Auto-archive flag: checked by the maintenance timer
+    let localCount = BLog.length(blockState) - localBlockOffset;
+    if (localCount > archiveBlockThreshold and not archiveInProgress) {
+      archiveNeeded := true;
     };
     idx
   };
@@ -617,9 +624,16 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   public query func icrc3_get_blocks(args : [T.GetBlocksArgs]) : async { blocks : [T.Block]; log_length : Nat } {
     let allBlocks = List.empty<T.Block>();
     for (range in args.vals()) {
-      let rawBlocks = BLog.getBlocks(blockState, range.start, range.length);
-      for (b in rawBlocks.vals()) {
-        List.add(allBlocks, { id = b.index; block = blockToValue(b) });
+      // Clamp range to locally-held blocks (archived blocks are in archive canisters)
+      let effectiveStart = Nat.max(range.start, localBlockOffset);
+      if (effectiveStart < BLog.length(blockState)) {
+        let localIdx = effectiveStart - localBlockOffset;
+        let effectiveLen = Nat.min(range.length, BLog.length(blockState) - effectiveStart);
+        let rawBlocks = BLog.getBlocks(blockState, localIdx, effectiveLen);
+        for (b in rawBlocks.vals()) {
+          // Restore absolute block index for the client
+          List.add(allBlocks, { id = localBlockOffset + b.index; block = blockToValue(b) });
+        };
       };
     };
     { blocks = List.toArray(allBlocks); log_length = BLog.length(blockState) }
@@ -694,14 +708,20 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       callback : shared query { start : Nat; length : Nat } -> async { transactions : [T.Block] };
     }];
   } {
-    let rawBlocks = BLog.getBlocks(blockState, args.start, args.length);
-    let blocks = Array.map<BLog.Block, T.Block>(rawBlocks, func(b) {
-      { id = b.index; block = blockToValue(b) }
-    });
+    // Only serve locally-held blocks; archived ranges are in archive canisters
+    let effectiveStart = Nat.max(args.start, localBlockOffset);
+    let blocks = if (effectiveStart < BLog.length(blockState)) {
+      let localIdx = effectiveStart - localBlockOffset;
+      let effectiveLen = Nat.min(args.length, BLog.length(blockState) - effectiveStart);
+      let rawBlocks = BLog.getBlocks(blockState, localIdx, effectiveLen);
+      Array.map<BLog.Block, T.Block>(rawBlocks, func(b) {
+        { id = localBlockOffset + b.index; block = blockToValue(b) }
+      })
+    } else { [] };
     {
       transactions = blocks;
       log_length = BLog.length(blockState);
-      archived_transactions = []; // single-canister: no archives
+      archived_transactions = []; // archive callbacks require shared functions — clients use icrc3_get_archives to discover archive canisters
     }
   };
 
@@ -890,6 +910,11 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // ═══════════════════════════════════════════════════════
 
   ignore Timer.recurringTimer<system>(#seconds 60, func() : async () {
-    ignore Allow.prune(allowState, 50); // GC up to 50 expired allowances per tick
+    ignore Allow.prune(allowState, 50);
+    // Auto-archive: trigger when block count exceeds threshold
+    if (archiveNeeded and not archiveInProgress) {
+      archiveNeeded := false;
+      ignore await triggerArchive(archiveBlockThreshold / 2, 1_000_000_000_000);
+    };
   });
 };
