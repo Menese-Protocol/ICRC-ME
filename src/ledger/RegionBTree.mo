@@ -376,16 +376,6 @@ module {
   /// Total number of entries
   public func size(state : State) : Nat { state.entryCount };
 
-  /// Iterate all entries in sorted order (for listSubaccounts).
-  /// WARNING: materializes all entries — use prefixScan for targeted queries.
-  public func entries(state : State) : [(Blob, Blob)] {
-    let result = List.empty<(Blob, Blob)>();
-    if (state.root != NULL_NODE) {
-      inorderCollect(state, state.root, result, 0xFFFF_FFFF);
-    };
-    List.toArray(result)
-  };
-
   /// Scan entries whose key starts with `prefix`. Returns up to `maxResults` entries.
   /// O(k log n) where k = matching entries, instead of O(n) for full iteration.
   public func prefixScan(state : State, prefix : Blob, maxResults : Nat) : [(Blob, Blob)] {
@@ -455,23 +445,6 @@ module {
       };
     };
     collected
-  };
-
-  func inorderCollect(state : State, node : Nat64, result : List.List<(Blob, Blob)>, maxResults : Nat) {
-    let count = nodeCount(state, node);
-    if (nodeType(state, node) == NODE_LEAF) {
-      var i = 0;
-      while (i < count) {
-        List.add(result, (leafKey(state, node, i), leafVal(state, node, i)));
-        i += 1;
-      };
-    } else {
-      var i = 0;
-      while (i <= count) {
-        inorderCollect(state, getChild(state, node, i), result, maxResults);
-        i += 1;
-      };
-    };
   };
 
   /// Memory stats
