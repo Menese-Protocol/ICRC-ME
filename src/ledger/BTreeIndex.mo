@@ -93,21 +93,31 @@ module {
     off
   };
 
-  func encodeValue(count : Nat, head : Nat64) : Blob {
-    let h = Nat64.toNat(head);
-    Blob.fromArray(Array.tabulate<Nat8>(10, func(i) {
+  // Value layout: [count:4][head:6][tail:6] = 16 bytes
+  // Tail pointer eliminates O(n) tail-walk on addIndex.
+
+  func encodeValue(count : Nat, head : Nat64, tail : Nat64) : Blob {
+    let hv = Nat64.toNat(head);
+    let tv = Nat64.toNat(tail);
+    Blob.fromArray(Array.tabulate<Nat8>(16, func(i) {
       if (i < 4) Nat8.fromNat((count / (256 ** (3 - i))) % 256)
-      else Nat8.fromNat((h / (256 ** (9 - i))) % 256)
+      else if (i < 10) Nat8.fromNat((hv / (256 ** (9 - i))) % 256)
+      else Nat8.fromNat((tv / (256 ** (15 - i))) % 256)
     }))
   };
 
-  func decodeValue(val : Blob) : (Nat, Nat64) {
+  func decodeValue(val : Blob) : (Nat, Nat64, Nat64) {
     let b = Blob.toArray(val);
     var count : Nat = 0;
     var i = 0; while (i < 4) { count := count * 256 + Nat8.toNat(b[i]); i += 1 };
     var head : Nat = 0;
     i := 4; while (i < 10) { head := head * 256 + Nat8.toNat(b[i]); i += 1 };
-    (count, Nat64.fromNat(head))
+    // Tail pointer — backwards compatible: if blob is only 10 bytes, tail = head
+    var tail : Nat = 0;
+    if (b.size() >= 16) {
+      i := 10; while (i < 16) { tail := tail * 256 + Nat8.toNat(b[i]); i += 1 };
+    } else { tail := head };
+    (count, Nat64.fromNat(head), Nat64.fromNat(tail))
   };
 
   // ── Delta-gap encoding (same as CompactIndex) ──
@@ -167,16 +177,15 @@ module {
           case null {
             let block = allocRawBlock(state);
             Region.storeNat32(state.blockRegion, block + BLOCK_HEADER, Nat32.fromNat(txIdx % 4294967296));
-            Region.storeNat8(state.blockRegion, block + 6, 1); // count=1
-            ignore BTree.put(state.btree, kb, encodeValue(1, block));
+            Region.storeNat8(state.blockRegion, block + 6, 1);
+            ignore BTree.put(state.btree, kb, encodeValue(1, block, block));
           };
           case (?existingVal) {
-            let (count, head) = decodeValue(existingVal);
-            // Walk to tail block
-            var block = head;
-            var next = load48(state.blockRegion, block);
-            while (next != NULL_PTR) { block := next; next := load48(state.blockRegion, block) };
+            let (count, head, tail) = decodeValue(existingVal);
+            // O(1) tail access — no chain walk needed
+            let block = tail;
             let capCode = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 7));
+            var newTail = tail;
             if (capCode < 4) {
               let bCount = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 6));
               if (bCount < FIRST_CAP) {
@@ -184,18 +193,20 @@ module {
                   Nat32.fromNat(txIdx % 4294967296));
                 Region.storeNat8(state.blockRegion, block + 6, Nat8.fromNat(bCount + 1));
               } else {
-                let newBlock = allocDeltaBlock(state, 128);
-                ignore deltaAppend(state, newBlock, txIdx, 128);
-                store48(state.blockRegion, block, newBlock);
+                let nb = allocDeltaBlock(state, 128);
+                ignore deltaAppend(state, nb, txIdx, 128);
+                store48(state.blockRegion, block, nb);
+                newTail := nb;
               };
             } else {
               if (not deltaAppend(state, block, txIdx, 128)) {
-                let newBlock = allocDeltaBlock(state, 512);
-                ignore deltaAppend(state, newBlock, txIdx, 512);
-                store48(state.blockRegion, block, newBlock);
+                let nb = allocDeltaBlock(state, 512);
+                ignore deltaAppend(state, nb, txIdx, 512);
+                store48(state.blockRegion, block, nb);
+                newTail := nb;
               };
             };
-            ignore BTree.put(state.btree, kb, encodeValue(count + 1, head));
+            ignore BTree.put(state.btree, kb, encodeValue(count + 1, head, newTail));
           };
         };
       };
@@ -207,23 +218,35 @@ module {
     switch (BTree.get(state.btree, kb)) {
       case null { [] };
       case (?val) {
-        let (_, head) = decodeValue(val);
+        let (count, head, _tail) = decodeValue(val);
+        // For small accounts (count <= maxResults * 2), collect all and reverse.
+        // For large accounts, collect all but cap at a reasonable limit.
+        // Chain is oldest→newest; we return newest→oldest.
+        let collectLimit = Nat.min(count, Nat.max(maxResults * 2, 200));
         let all = List.empty<Nat>();
         var block = head;
-        while (block != NULL_PTR) {
+        var collected : Nat = 0;
+        while (block != NULL_PTR and collected < count) {
           let capCode = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 7));
           if (capCode < 4) {
             let bCount = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 6));
             var i = 0;
             while (i < bCount) {
               List.add(all, Nat32.toNat(Region.loadNat32(state.blockRegion, block + BLOCK_HEADER + Nat64.fromNat(i * 4))));
+              collected += 1;
               i += 1;
             };
-          } else { for (e in deltaReadAll(state, block).vals()) { List.add(all, e) } };
+          } else {
+            for (e in deltaReadAll(state, block).vals()) {
+              List.add(all, e);
+              collected += 1;
+            };
+          };
           block := load48(state.blockRegion, block);
         };
         let arr = List.toArray(all);
         let n = Nat.min(arr.size(), maxResults);
+        // Return newest-first (from end of array)
         Array.tabulate<Nat>(n, func(i) { arr[arr.size() - 1 - i] })
       };
     };
@@ -235,7 +258,7 @@ module {
     switch (BTree.get(state.btree, kb)) {
       case null null;
       case (?val) {
-        let (_, head) = decodeValue(val);
+        let (_, head, _tail) = decodeValue(val);
         // The first block's first entry is the oldest tx index
         let capCode = Nat8.toNat(Region.loadNat8(state.blockRegion, head + 7));
         if (capCode < 4) {

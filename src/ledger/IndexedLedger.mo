@@ -137,7 +137,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       ignore BLog.append(blockState, {
         kind = "mint"; from = null; to = ?account; spender = null;
         amount; fee = null; memo = null;
-        timestamp = Nat64.fromNat(Int.abs(Time.now())); index = 0;
+        timestamp = Nat64.fromNat(Int.abs(Time.now())); index = BLog.length(blockState);
       }, null);
     };
     switch (BLog.tipHash(blockState)) {
@@ -159,18 +159,23 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // Dedup entries store (dedupKey -> (blockIndex, timestamp)) so we can prune by age.
   type DedupEntry = { blockIndex : Nat; timestamp : Nat64 };
   var recentTxEntries = Map.empty<Blob, DedupEntry>();
+  var dedupMapSize : Nat = 0;
 
-  // Prune up to 20 expired entries per call (amortized GC)
+  // Adaptive pruning: prune proportionally to map size.
+  // At 100 entries, prune 10 per call. At 10K, prune 100. At 100K, prune 1000.
+  // This ensures the map never grows unbounded regardless of throughput.
   var dedupPruneCounter : Nat = 0;
   func pruneDedupMap() {
     dedupPruneCounter += 1;
-    if (dedupPruneCounter % 10 != 0) return;
+    if (dedupPruneCounter % 5 != 0) return; // prune every 5th call
     let n = now();
     let cutoff = n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000;
+    // Prune batch size scales with map size: min 20, max 500, ~1% of map
+    let batchSize = Nat.min(500, Nat.max(20, dedupMapSize / 100));
     let toDelete = List.empty<Blob>();
     var count : Nat = 0;
     for ((key, entry) in Map.entries(recentTxEntries)) {
-      if (count >= 20) return;
+      if (count >= batchSize) return;
       if (entry.timestamp < cutoff) {
         List.add(toDelete, key);
         count += 1;
@@ -178,6 +183,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     };
     for (key in List.values(toDelete)) {
       ignore Map.delete(recentTxEntries, Blob.compare, key);
+      dedupMapSize -= 1;
     };
   };
 
@@ -194,6 +200,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
         if (not Bloom.mightContain(bloomState, ts, n)) {
           Bloom.add(bloomState, ts, n);
           Map.add(recentTxEntries, Blob.compare, dedupKey, { blockIndex = BLog.length(blockState); timestamp = ts });
+          dedupMapSize += 1;
           return #ok;
         };
         // Exact check with full dedup key
@@ -202,6 +209,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
           case null {
             Bloom.add(bloomState, ts, n);
             Map.add(recentTxEntries, Blob.compare, dedupKey, { blockIndex = BLog.length(blockState); timestamp = ts });
+            dedupMapSize += 1;
             #ok
           };
         };

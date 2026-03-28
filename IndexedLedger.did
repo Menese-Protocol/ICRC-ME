@@ -86,8 +86,20 @@ type InitArgs =
  };
 type IndexedLedger = 
  service {
+   getShieldStatus: () ->
+    (record {
+       blockCount: nat;
+       cycleBalance: nat;
+       threshold: nat;
+       tripped: bool;
+     }) query;
    get_account_transactions: (args: GetAccountTransactionsArgs) ->
     (GetAccountTransactionsResult) query;
+   icrc10_supported_standards: () ->
+    (vec record {
+           name: text;
+           url: text;
+         }) query;
    icrc1_balance_of: (account: Account) -> (nat) query;
    icrc1_decimals: () -> (nat8) query;
    icrc1_fee: () -> (nat) query;
@@ -120,19 +132,43 @@ type IndexedLedger =
        Err: TransferFromError;
        Ok: nat;
      });
+   icrc3_get_archives: (args: record {from: opt principal;}) ->
+    (vec record {
+           canister_id: principal;
+           end: nat;
+           start: nat;
+         }) query;
    icrc3_get_blocks: (args: vec GetBlocksArgs) ->
     (record {
        blocks: vec Block;
        log_length: nat;
      }) query;
-   /// Get the certified tip of the block chain.
-   /// Returns the IC subnet BLS certificate + CBOR-encoded hash tree.
-   /// Clients verify: cert → certified_data == hash(tree) → tree witnesses last_block_hash.
    icrc3_get_tip_certificate: () ->
     (opt record {
            certificate: blob;
            hash_tree: blob;
          }) query;
+   icrc3_get_transactions: (args: record {
+                                    length: nat;
+                                    start: nat;
+                                  }) ->
+    (record {
+       archived_transactions:
+        vec
+         record {
+           args: record {
+                   length: nat;
+                   start: nat;
+                 };
+           callback:
+            func (record {
+                    length: nat;
+                    start: nat;
+                  }) -> (record {transactions: vec Block;}) query;
+         };
+       log_length: nat;
+       transactions: vec Block;
+     }) query;
    /// ICRC-3: Supported block types
    icrc3_supported_block_types: () ->
     (vec record {
@@ -140,10 +176,21 @@ type IndexedLedger =
            url: text;
          }) query;
    list_subaccounts: (owner: principal, start: opt blob) -> (vec blob) query;
+   /// Generate an inclusion proof for a specific block
+   mmr_proof: (blockIndex: nat) ->
+    (opt record {
+           peakIndex: nat;
+           peaks: vec blob;
+           siblings: vec blob;
+         }) query;
+   /// Get the MMR root hash (commitment over all blocks)
+   mmr_root: () -> (opt blob) query;
+   setCircuitBreakerThreshold: (newThreshold: nat) -> ();
    set_fee_collector: (fc: opt Account) -> ();
    status: () ->
     (record {
        index_synced: bool;
+       mmr_peaks: nat;
        total_accounts: nat;
        total_allowances: nat;
        total_supply: nat;
@@ -213,13 +260,15 @@ type Account =
    owner: principal;
    subaccount: opt blob;
  };
-/// IndexedLedger.mo — Self-Indexed ICRC-1/ICRC-2 Token Ledger (v2)
+/// IndexedLedger.mo — Self-Indexed ICRC-1/ICRC-2/ICRC-3/ICRC-10 Token Ledger
 /// 
-/// Refactored to use modular components:
-///   - Balances.mo (port of DFINITY balances.rs)
-///   - Allowances.mo (port of DFINITY approvals.rs)
-///   - BlockLog.mo (append-only log with hash chain + built-in account index)
+/// This actor constitutes the entry point of the ICRC-ME ledger. It composes
+/// eleven internal modules into a single canister that provides full ICRC
+/// compliance; account-level transaction indexing; Merkle inclusion proofs;
+/// and cycle drain protection. The separate index canister required by the
+/// reference architecture is eliminated; its function is absorbed here via
+/// a Region-backed account index that incurs zero garbage collection overhead
+/// regardless of the number of accounts or accumulated blocks.
 /// 
-/// FIRST ON ICP: Eliminates the separate index canister entirely.
-/// Every transfer atomically updates the account transaction index.
+/// All state survives canister upgrades via Enhanced Orthogonal Persistence.
 service : (args: InitArgs) -> IndexedLedger

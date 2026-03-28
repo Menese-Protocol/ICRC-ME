@@ -44,12 +44,12 @@ module {
 
   let PAGE_SIZE : Nat64 = 8192;     // 8KB per node
   let KEY_SIZE : Nat = 62;          // accountKeyToBlob output
-  let VAL_SIZE : Nat = 10;          // [count:4][chain_head:6]
-  let ENTRY_SIZE : Nat = 72;        // KEY_SIZE + VAL_SIZE
+  let VAL_SIZE : Nat = 16;          // [count:4][chain_head:6][chain_tail:6]
+  let ENTRY_SIZE : Nat = 78;        // KEY_SIZE + VAL_SIZE
   let CHILD_PTR : Nat = 6;          // 48-bit node offset
 
-  let LEAF_CAP : Nat = 113;      // (8192 - 3) / 72
-  let INTERNAL_CAP : Nat = 120;  // (8192 - 3 - 6) / (62 + 6)
+  let LEAF_CAP : Nat = 104;      // (8192 - 3) / 78
+  let INTERNAL_CAP : Nat = 120;  // (8192 - 3 - 6) / (62 + 6) — unchanged, internal nodes don't store values
 
   let NODE_LEAF : Nat8 = 0;
   let NODE_INTERNAL : Nat8 = 1;
