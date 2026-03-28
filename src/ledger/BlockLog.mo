@@ -16,6 +16,7 @@ import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 import VarArray "mo:core/VarArray";
 import List "mo:core/List";
+import Map "mo:core/Map";
 import Text "mo:core/Text";
 import Time "mo:core/Time";
 import Principal "mo:core/Principal";
@@ -26,7 +27,7 @@ import T "Types";
 import SLog "StableLog";
 import CBOR "CBOR";
 import MMR "MerkleMMR";
-import RIdx "RegionIndex";
+import CIdx "CompactIndex";
 
 module {
 
@@ -101,22 +102,15 @@ module {
     digest.writeBlob(kindBytes);
     // Amount: variable-length big-endian
     natToBytes(digest, tx.amount);
-    // Accounts: principal + subaccount with presence flags
-    func hashAccount(digest2 : Sha256.Digest, acc : ?T.Account) {
-      switch (acc) {
-        case (?a) {
-          digest2.writeArray([0x01]);
-          digest2.writeBlob(Principal.toBlob(a.owner));
-          switch (a.subaccount) {
-            case (?s) { digest2.writeArray([0x01]); digest2.writeBlob(s) };
-            case null { digest2.writeArray([0x00]) };
-          };
-        };
-        case null { digest2.writeArray([0x00]) };
-      };
+    // Accounts: principal bytes with presence flag
+    switch (tx.from) {
+      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
+      case null { digest.writeArray([0x00]) };
     };
-    hashAccount(digest, tx.from);
-    hashAccount(digest, tx.to);
+    switch (tx.to) {
+      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
+      case null { digest.writeArray([0x00]) };
+    };
     // Fee: presence flag + variable-length
     switch (effectiveFee) {
       case (?f) { digest.writeArray([0x01]); natToBytes(digest, f) };
@@ -132,18 +126,20 @@ module {
   public type State = {
     var blockCount : Nat;
     var lastHash : ?Blob;
+    var subaccountMap : Map.Map<Principal, List.List<Blob>>;
     stableLog : SLog.State;
     mmr : MMR.State;
-    regionIndex : RIdx.State;
+    compactIndex : CIdx.State;
   };
 
   public func newState() : State {
     {
       var blockCount = 0;
       var lastHash : ?Blob = null;
+      var subaccountMap = Map.empty<Principal, List.List<Blob>>();
       stableLog = SLog.newState();
       mmr = MMR.newState();
-      regionIndex = RIdx.newState();
+      compactIndex = CIdx.newState();
     };
   };
 
@@ -164,9 +160,11 @@ module {
     state.blockCount += 1;
     state.lastHash := ?hash;
     // Index accounts in Region (stable memory; invisible to GC)
-    RIdx.addIndex(state.regionIndex, tx.from, idx);
-    RIdx.addIndex(state.regionIndex, tx.to, idx);
-    RIdx.addIndex(state.regionIndex, tx.spender, idx);
+    CIdx.addIndex(state.compactIndex, tx.from, idx);
+    CIdx.addIndex(state.compactIndex, tx.to, idx);
+    CIdx.addIndex(state.compactIndex, tx.spender, idx);
+    trackSub(state, tx.from);
+    trackSub(state, tx.to);
     idx
   };
 
@@ -177,7 +175,7 @@ module {
   // ═══════════════════════════════════════════════════════
 
   func encodeBlock(_idx : Nat, parentHash : ?Blob, _hash : Blob, ts : Nat64, tx : T.Transaction, fee : ?Nat) : Blob {
-    let buf = VarArray.repeat<Nat8>(0, 600); // max: 1+8+1+1+10+1+32+3*(1+29+1+32)+1+32+2+256+32 = ~530
+    let buf = VarArray.repeat<Nat8>(0, 256);
     var len : Nat = 0;
     func w(b : Nat8) { buf[len] := b; len += 1 };
     func wBlob(b : Blob) { for (byte in b.vals()) { w(byte) } };
@@ -371,16 +369,34 @@ module {
     };
   };
 
+  func trackSub(state : State, account : ?T.Account) {
+    switch (account) {
+      case (?a) {
+        let sub = switch (a.subaccount) { case (?s) s; case null "" : Blob };
+        let existing = switch (Map.get(state.subaccountMap, Principal.compare, a.owner)) {
+          case (?list) list; case null List.empty<Blob>();
+        };
+        var found = false;
+        for (s in List.values(existing)) { if (s == sub) found := true };
+        if (not found) {
+          List.add(existing, sub);
+          Map.add(state.subaccountMap, Principal.compare, a.owner, existing);
+        };
+      };
+      case null {};
+    };
+  };
+
   // ═══════════════════════════════════════════════════════
   //  INDEX QUERIES
   // ═══════════════════════════════════════════════════════
 
   public func getAccountTransactions(state : State, account : T.Account, start : ?Nat, maxResults : Nat) : [T.Transaction] {
-    let indices = RIdx.getIndices(state.regionIndex, account, Nat.min(maxResults, 100));
+    let indices = CIdx.getIndices(state.compactIndex, account, Nat.min(maxResults, 100));
+    // indices are newest-first from RegionIndex; apply start filter
     let result = List.empty<T.Transaction>();
-    label scan for (txIdx in indices.vals()) {
-      // Skip indices newer than start
-      switch (start) { case (?s) { if (txIdx > s) { continue scan } }; case null {} };
+    for (txIdx in indices.vals()) {
+      switch (start) { case (?s) { if (txIdx > s) { /* skip newer than start */ } else {} }; case null {} };
       switch (SLog.get(state.stableLog, txIdx)) {
         case (?data) {
           switch (decodeBlock(txIdx, data)) {
@@ -395,13 +411,29 @@ module {
   };
 
   public func getOldestTxId(state : State, account : T.Account) : ?Nat {
-    let indices = RIdx.getIndices(state.regionIndex, account, 1000);
+    let indices = CIdx.getIndices(state.compactIndex, account, 1000);
     if (indices.size() == 0) null else ?indices[indices.size() - 1]
   };
 
   public func listSubaccounts(state : State, owner : Principal, start : ?Blob) : [Blob] {
-    ignore start; // pagination not supported in Region scan; returns all
-    RIdx.listSubaccounts(state.regionIndex, owner, 1000)
+    switch (Map.get(state.subaccountMap, Principal.compare, owner)) {
+      case (?list) {
+        let all = List.toArray(list);
+        switch (start) {
+          case null all;
+          case (?s) {
+            var found = false;
+            let result = List.empty<Blob>();
+            for (sub in all.vals()) {
+              if (found) { List.add(result, sub) };
+              if (sub == s) { found := true };
+            };
+            List.toArray(result)
+          };
+        };
+      };
+      case null [];
+    };
   };
 
   // ═══════════════════════════════════════════════════════
@@ -463,11 +495,11 @@ module {
 
   /// Query the Region-backed index for an account's tx indices
   public func regionGetIndices(state : State, account : T.Account, maxResults : Nat) : [Nat] {
-    RIdx.getIndices(state.regionIndex, account, maxResults)
+    CIdx.getIndices(state.compactIndex, account, maxResults)
   };
 
   /// Number of accounts in the Region index
   public func regionAccountCount(state : State) : Nat {
-    RIdx.accountCount(state.regionIndex)
+    CIdx.accountCount(state.compactIndex)
   };
 };
