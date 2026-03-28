@@ -28,26 +28,41 @@ The resulting canister operates at 94-114% of the Rust ICRC reference ledger's p
 
 ## Performance
 
-Measured on a local IC replica against the Rust ICRC reference ledger (`ic-icrc1-ledger`). Cycles obtained from canister status balance differentials over batches of 20-50 operations.
+Benchmarked via PocketIC (IC's Wasm execution environment without consensus) at 10,000 accounts. Cycle counts from canister balance differentials. Throughput measured end-to-end including Candid encoding overhead.
+
+### Cycle Cost per Operation
 
 | Operation | ICRC-ME (Motoko) | Rust ICRC Reference | Ratio |
 |-----------|-----------------|---------------------|-------|
-| Transfer | 7.7M cycles | 8.1M cycles | **94% (6% faster)** |
-| Approve | 8.6M cycles | 7.5M cycles | 114% |
-| Balance query | 40K cycles | 39K cycles | 102% (parity) |
+| **Transfer** | **7.0M cycles** | 8.1M cycles | **86% (14% faster than Rust)** |
+| Mint | 10.3M cycles | ~8.1M cycles | 127% |
+| Balance query | ~50K cycles | ~39K cycles | 128% |
 | get_blocks(50) | 194K cycles | 7.2M cycles | **2% (37x faster)** |
-| Account index query | 100K cycles | N/A (separate canister) | Built-in |
+| Account index query | ~100K cycles | N/A (separate canister) | Built-in |
 | Index canister daily cost | 0 | ~3.32T cycles | Eliminated |
 | Estimated annual saving | — | ~$1,618 per token | — |
+
+Transfers are 14% cheaper than the Rust reference because the Region-backed B-tree provides efficient O(log n) balance lookups without GC overhead. Mints are more expensive due to B-tree node insertion and splitting. Block reads are 37x faster thanks to the v3 compact binary encoding with stored hashes (zero SHA-256 recomputation on reads).
+
+### Scaling (PocketIC, 10K accounts)
+
+| Phase | Operations | Throughput | Cycles/op | Notes |
+|-------|-----------|-----------|-----------|-------|
+| Mint 10K accounts | 10,000 | 24/sec | 10.3M | Flat cost from account 1 to 10,000 |
+| Random transfers | 2,000 | 15/sec | 7.0M | 100% success rate between funded accounts |
+| Balance queries | 2,000 | 205/sec | ~50K | Region B-tree read |
+
+Cycle cost is flat regardless of account count — the Region-backed B-tree depth grows logarithmically (4 levels at 10M accounts). Throughput numbers are PocketIC client-side limited; on-chain execution is ~0.5ms per transfer.
 
 ### Storage
 
 | Metric | ICRC-ME | Rust Reference |
 |--------|---------|----------------|
 | WASM size | 715 KB | 1,245 KB |
-| Per-account overhead | ~112 bytes (B-tree leaf + chain block) | N/A (no built-in index) |
-| B-tree depth at 1B accounts | ~4 levels | N/A |
-| Scaling capacity | 10M accounts within 64GB | N/A |
+| Per-account overhead | ~78 bytes (B-tree leaf) | N/A (no built-in index) |
+| B-tree depth at 10M accounts | ~4 levels | N/A |
+| Stable memory regions | 7 (balances, index, blocks, MMR, StableLog×2, block chains) | N/A |
+| Heap usage | Near zero (all data in Region) | N/A (Rust has no GC) |
 
 ## Security
 
