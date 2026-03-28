@@ -110,11 +110,6 @@ module {
     Nat64.fromNat(Nat32.toNat(h)) % NUM_BUCKETS
   };
 
-  func nextCap(cap : Nat) : Nat {
-    if (cap < 32) 32
-    else if (cap < 128) 128
-    else 512
-  };
 
   // ═══════════════════════════════════════════════════════
   //  BLOCK CHAIN OPERATIONS
@@ -379,7 +374,6 @@ module {
     switch (findSlot(state, kb)) {
       case null { [] };
       case (?slot) {
-        let count = Nat32.toNat(Region.loadNat32(state.slotRegion, slot + SLOT_KEY));
         let head = load48(state.slotRegion, slot + SLOT_KEY + 4);
         if (head == NULL_PTR) return [];
 

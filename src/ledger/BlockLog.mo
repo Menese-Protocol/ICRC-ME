@@ -16,7 +16,6 @@ import Blob "mo:core/Blob";
 import Array "mo:core/Array";
 import VarArray "mo:core/VarArray";
 import List "mo:core/List";
-import Map "mo:core/Map";
 import Text "mo:core/Text";
 import Time "mo:core/Time";
 import Principal "mo:core/Principal";
@@ -102,15 +101,21 @@ module {
     digest.writeBlob(kindBytes);
     // Amount: variable-length big-endian
     natToBytes(digest, tx.amount);
-    // Accounts: principal bytes with presence flag
-    switch (tx.from) {
-      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
-      case null { digest.writeArray([0x00]) };
+    // Accounts: principal + subaccount with presence flags
+    func hashAccount(d : Sha256.Digest, acc : ?T.Account) {
+      switch (acc) {
+        case (?a) {
+          d.writeArray([0x01]); d.writeBlob(Principal.toBlob(a.owner));
+          switch (a.subaccount) {
+            case (?s) { d.writeArray([0x01]); d.writeBlob(s) };
+            case null { d.writeArray([0x00]) };
+          };
+        };
+        case null { d.writeArray([0x00]) };
+      };
     };
-    switch (tx.to) {
-      case (?a) { digest.writeArray([0x01]); digest.writeBlob(Principal.toBlob(a.owner)) };
-      case null { digest.writeArray([0x00]) };
-    };
+    hashAccount(digest, tx.from);
+    hashAccount(digest, tx.to);
     // Fee: presence flag + variable-length
     switch (effectiveFee) {
       case (?f) { digest.writeArray([0x01]); natToBytes(digest, f) };
@@ -126,7 +131,6 @@ module {
   public type State = {
     var blockCount : Nat;
     var lastHash : ?Blob;
-    var subaccountMap : Map.Map<Principal, List.List<Blob>>;
     stableLog : SLog.State;
     mmr : MMR.State;
     compactIndex : CIdx.State;
@@ -136,7 +140,6 @@ module {
     {
       var blockCount = 0;
       var lastHash : ?Blob = null;
-      var subaccountMap = Map.empty<Principal, List.List<Blob>>();
       stableLog = SLog.newState();
       mmr = MMR.newState();
       compactIndex = CIdx.newState();
@@ -163,8 +166,6 @@ module {
     CIdx.addIndex(state.compactIndex, tx.from, idx);
     CIdx.addIndex(state.compactIndex, tx.to, idx);
     CIdx.addIndex(state.compactIndex, tx.spender, idx);
-    trackSub(state, tx.from);
-    trackSub(state, tx.to);
     idx
   };
 
@@ -175,7 +176,7 @@ module {
   // ═══════════════════════════════════════════════════════
 
   func encodeBlock(_idx : Nat, parentHash : ?Blob, _hash : Blob, ts : Nat64, tx : T.Transaction, fee : ?Nat) : Blob {
-    let buf = VarArray.repeat<Nat8>(0, 256);
+    let buf = VarArray.repeat<Nat8>(0, 600);
     var len : Nat = 0;
     func w(b : Nat8) { buf[len] := b; len += 1 };
     func wBlob(b : Blob) { for (byte in b.vals()) { w(byte) } };
@@ -369,24 +370,6 @@ module {
     };
   };
 
-  func trackSub(state : State, account : ?T.Account) {
-    switch (account) {
-      case (?a) {
-        let sub = switch (a.subaccount) { case (?s) s; case null "" : Blob };
-        let existing = switch (Map.get(state.subaccountMap, Principal.compare, a.owner)) {
-          case (?list) list; case null List.empty<Blob>();
-        };
-        var found = false;
-        for (s in List.values(existing)) { if (s == sub) found := true };
-        if (not found) {
-          List.add(existing, sub);
-          Map.add(state.subaccountMap, Principal.compare, a.owner, existing);
-        };
-      };
-      case null {};
-    };
-  };
-
   // ═══════════════════════════════════════════════════════
   //  INDEX QUERIES
   // ═══════════════════════════════════════════════════════
@@ -395,8 +378,8 @@ module {
     let indices = CIdx.getIndices(state.compactIndex, account, Nat.min(maxResults, 100));
     // indices are newest-first from RegionIndex; apply start filter
     let result = List.empty<T.Transaction>();
-    for (txIdx in indices.vals()) {
-      switch (start) { case (?s) { if (txIdx > s) { /* skip newer than start */ } else {} }; case null {} };
+    label scan for (txIdx in indices.vals()) {
+      switch (start) { case (?s) { if (txIdx > s) { continue scan } }; case null {} };
       switch (SLog.get(state.stableLog, txIdx)) {
         case (?data) {
           switch (decodeBlock(txIdx, data)) {
@@ -416,24 +399,8 @@ module {
   };
 
   public func listSubaccounts(state : State, owner : Principal, start : ?Blob) : [Blob] {
-    switch (Map.get(state.subaccountMap, Principal.compare, owner)) {
-      case (?list) {
-        let all = List.toArray(list);
-        switch (start) {
-          case null all;
-          case (?s) {
-            var found = false;
-            let result = List.empty<Blob>();
-            for (sub in all.vals()) {
-              if (found) { List.add(result, sub) };
-              if (sub == s) { found := true };
-            };
-            List.toArray(result)
-          };
-        };
-      };
-      case null [];
-    };
+    ignore start;
+    CIdx.listSubaccounts(state.compactIndex, owner, 1000)
   };
 
   // ═══════════════════════════════════════════════════════
