@@ -170,32 +170,43 @@ module {
     };
   };
 
-  /// Prune expired allowances + stale queue entries. Call periodically to free memory.
+  /// Prune expired allowances. Scans from the front of the queue (oldest expiry first)
+  /// and stops after `limit` deletions OR when hitting a non-expired entry.
+  /// Queue entries are kept sorted by expiry time (approvals append to tail).
+  /// Stale entries (re-approved, deleted) are dropped in O(1) as encountered.
   public func prune(state : State, limit : Nat) : Nat {
     let now = Nat64.fromNat(Int.abs(Time.now()));
     var pruned : Nat = 0;
+    var scanned : Nat = 0;
+    let maxScan = limit * 5; // scan up to 5x limit to clear stale entries
     var remaining = List.empty<(Nat64, AllowanceKey)>();
+    var hitLiveEntry = false;
 
     for ((exp, key) in List.values(state.expirationQueue)) {
-      // Skip stale queue entries (already deleted by getAllowance or re-approved without expiry)
-      switch (Map.get(state.table, allowanceKeyCompare, key)) {
-        case null {}; // Already gone — drop from queue
-        case (?record) {
-          if (pruned >= limit) {
-            List.add(remaining, (exp, key));
-          } else if (exp <= now) {
-            ignore Map.delete(state.table, allowanceKeyCompare, key);
-            pruned += 1;
-          } else {
-            // Check if this queue entry matches current record's expiry (skip stale duplicates)
-            switch (record.expires_at) {
-              case (?currentExp) {
-                if (currentExp == exp) {
-                  List.add(remaining, (exp, key)); // Still valid
+      if (hitLiveEntry or (pruned >= limit and scanned >= maxScan)) {
+        // Past our budget — keep the rest as-is
+        List.add(remaining, (exp, key));
+      } else {
+        scanned += 1;
+        switch (Map.get(state.table, allowanceKeyCompare, key)) {
+          case null {}; // Already gone — drop silently
+          case (?record) {
+            if (exp <= now) {
+              // Check if this queue entry still matches the record
+              switch (record.expires_at) {
+                case (?currentExp) {
+                  if (currentExp == exp) {
+                    ignore Map.delete(state.table, allowanceKeyCompare, key);
+                    pruned += 1;
+                  };
+                  // else: stale duplicate — drop
                 };
-                // else: stale duplicate with old expiry — drop it
+                case null {}; // No longer expires — drop
               };
-              case null {}; // Allowance no longer expires — drop queue entry
+            } else {
+              // Not expired yet — keep and stop scanning (queue is ~sorted)
+              List.add(remaining, (exp, key));
+              hitLiveEntry := true;
             };
           };
         };

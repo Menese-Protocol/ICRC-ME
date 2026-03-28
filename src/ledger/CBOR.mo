@@ -262,32 +262,36 @@ module {
       if (pos >= data.size()) null else ?data[pos];
     };
 
-    /// Skip any CBOR value (recursive)
-    public func skipValue() : Bool {
+    let MAX_DEPTH : Nat = 128; // prevents stack overflow from malicious nesting
+
+    /// Skip any CBOR value (recursive, depth-limited)
+    public func skipValue() : Bool { skipValueDepth(0) };
+
+    func skipValueDepth(depth : Nat) : Bool {
+      if (depth > MAX_DEPTH) return false;
       switch (decodeHead()) {
         case null false;
         case (?(mt, arg)) {
-          if (mt == 0 or mt == 1) { true } // integer — already consumed
-          else if (mt == 2 or mt == 3) { // bytes/text
+          if (mt == 0 or mt == 1) { true }
+          else if (mt == 2 or mt == 3) {
             switch (readBytes(arg)) { case null false; case _ true };
-          } else if (mt == 4) { // array
+          } else if (mt == 4) {
             var i = 0;
             while (i < arg) {
-              if (not skipValue()) return false;
+              if (not skipValueDepth(depth + 1)) return false;
               i += 1;
             };
             true
-          } else if (mt == 5) { // map
+          } else if (mt == 5) {
             var i = 0;
             while (i < arg) {
-              if (not skipValue()) return false; // key
-              if (not skipValue()) return false; // value
+              if (not skipValueDepth(depth + 1)) return false;
+              if (not skipValueDepth(depth + 1)) return false;
               i += 1;
             };
             true
-          } else if (mt == 6) { // tag — skip inner value
-            skipValue()
-          } else { false };
+          } else if (mt == 6) { skipValueDepth(depth + 1) }
+          else { false };
         };
       };
     };

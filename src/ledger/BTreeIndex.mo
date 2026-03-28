@@ -219,34 +219,46 @@ module {
       case null { [] };
       case (?val) {
         let (count, head, _tail) = decodeValue(val);
-        // For small accounts (count <= maxResults * 2), collect all and reverse.
-        // For large accounts, collect all but cap at a reasonable limit.
-        // Chain is oldest→newest; we return newest→oldest.
-        let collectLimit = Nat.min(count, Nat.max(maxResults * 2, 200));
-        let all = List.empty<Nat>();
+        // Chain is oldest→newest. We want the newest `maxResults` entries reversed.
+        // Skip the first (count - maxResults) entries without storing them.
+        let skip = if (count > maxResults) count - maxResults else 0;
+        let collect = List.empty<Nat>();
         var block = head;
-        var collected : Nat = 0;
-        while (block != NULL_PTR and collected < count) {
+        var position : Nat = 0;
+        label walk while (block != NULL_PTR) {
           let capCode = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 7));
           if (capCode < 4) {
             let bCount = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 6));
-            var i = 0;
-            while (i < bCount) {
-              List.add(all, Nat32.toNat(Region.loadNat32(state.blockRegion, block + BLOCK_HEADER + Nat64.fromNat(i * 4))));
-              collected += 1;
-              i += 1;
+            // Can we skip this entire raw block?
+            if (position + bCount <= skip) {
+              position += bCount;
+            } else {
+              var i = 0;
+              while (i < bCount) {
+                if (position >= skip) {
+                  List.add(collect, Nat32.toNat(Region.loadNat32(state.blockRegion, block + BLOCK_HEADER + Nat64.fromNat(i * 4))));
+                };
+                position += 1;
+                i += 1;
+              };
             };
           } else {
-            for (e in deltaReadAll(state, block).vals()) {
-              List.add(all, e);
-              collected += 1;
+            let blockCount = Nat8.toNat(Region.loadNat8(state.blockRegion, block + 6));
+            // Can we skip this entire delta block?
+            if (position + blockCount <= skip) {
+              position += blockCount;
+            } else {
+              for (e in deltaReadAll(state, block).vals()) {
+                if (position >= skip) { List.add(collect, e) };
+                position += 1;
+              };
             };
           };
           block := load48(state.blockRegion, block);
         };
-        let arr = List.toArray(all);
+        let arr = List.toArray(collect);
         let n = Nat.min(arr.size(), maxResults);
-        // Return newest-first (from end of array)
+        // Reverse to newest-first
         Array.tabulate<Nat>(n, func(i) { arr[arr.size() - 1 - i] })
       };
     };

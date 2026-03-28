@@ -186,18 +186,23 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   type DedupEntry = { blockIndex : Nat; timestamp : Nat64 };
   var recentTxEntries = Map.empty<Blob, DedupEntry>();
   var dedupMapSize : Nat = 0;
+  let DEDUP_MAP_CAP : Nat = 500_000; // hard ceiling — emergency eviction if exceeded
 
-  // Adaptive pruning: prune proportionally to map size.
-  // At 100 entries, prune 10 per call. At 10K, prune 100. At 100K, prune 1000.
-  // This ensures the map never grows unbounded regardless of throughput.
+  // Adaptive pruning: scales with map size. Emergency eviction at hard cap.
   var dedupPruneCounter : Nat = 0;
   func pruneDedupMap() {
     dedupPruneCounter += 1;
-    if (dedupPruneCounter % 5 != 0) return; // prune every 5th call
+    // Normal pruning every 5th call; emergency every call if at cap
+    let emergency = dedupMapSize >= DEDUP_MAP_CAP;
+    if (not emergency and dedupPruneCounter % 5 != 0) return;
     let n = now();
-    let cutoff = n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000;
-    // Prune batch size scales with map size: min 20, max 500, ~1% of map
-    let batchSize = Nat.min(500, Nat.max(20, dedupMapSize / 100));
+    let cutoff = if (emergency) {
+      // Emergency: aggressively evict anything older than half the window
+      n - TX_WINDOW_NS / 2
+    } else {
+      n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000
+    };
+    let batchSize = if (emergency) 2000 else Nat.min(500, Nat.max(20, dedupMapSize / 100));
     let toDelete = List.empty<Blob>();
     var count : Nat = 0;
     for ((key, entry) in Map.entries(recentTxEntries)) {
